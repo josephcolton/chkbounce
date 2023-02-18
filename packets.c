@@ -14,9 +14,13 @@
 #include "global.h"
 #include "packets.h"
 
+#define PACKET_SIZE 4096
+
+/*********************************
+ * send_icmp - Send ICMP packets *
+ *********************************/
 int send_icmp(char *srcip, char *dstip, unsigned char ttl, unsigned char icmp_type) {
-  int handle;
-  int bytes;
+  int handle, bytes;
   unsigned int src, dst;
 
   // Convert source and destination addresses
@@ -26,7 +30,7 @@ int send_icmp(char *srcip, char *dstip, unsigned char ttl, unsigned char icmp_ty
   // Structure to keep track of where the packet is going
   static struct sockaddr_in tostruct;
 
-  // Create the spoofed icmp packet
+  // Create the icmp packet
   struct icmp_packet packet;
 
   // ip portion
@@ -76,4 +80,60 @@ int send_icmp(char *srcip, char *dstip, unsigned char ttl, unsigned char icmp_ty
 
   // Return bytes sent
   return bytes;
+}
+
+/***************************************
+ * recv_icmp - Listen for ICMP Packets *
+ ***************************************/
+void recv_icmp() {
+  int handle, data_size, bytes, addr_len;
+  char buffer[PACKET_SIZE];
+  struct sockaddr_in addr;
+  struct icmp_packet *packet;
+
+  // Create a raw socket with ICMP protocol
+  handle = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+  if (handle < 0) {
+    printf("Error creating socket.  Got root?\n");
+    exit(0);
+  }
+
+  // set socket option to receive all incoming packets
+  int on = 1;
+  if (setsockopt(handle, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0) {
+    printf("Error setting socket option\n");
+    exit(0);
+  }
+
+  // Listen for incoming ICMP packets
+  while (1) {
+    addr_len = sizeof(addr);
+
+    // Receive packet
+    bytes = recvfrom(handle,
+		     buffer,
+		     PACKET_SIZE,
+		     0,
+		     (struct sockaddr *)&addr,
+		     &addr_len);
+
+    // Make sure we received something
+    if (bytes < 0) {
+      printf("Error receiving ICMP packet");
+      continue;
+    }
+    
+    // Extract the ICMP packet
+    packet = (struct icmp_packet *)&buffer;
+    
+    // Display information about the ICMP packet we received
+    printf("Received %s ", inet_ntoa(addr.sin_addr));
+    printf("- IP TTL: %d, Id: %d ",
+	   packet->ip.ttl, ntohs(packet->ip.id));
+    printf("- ICMP Type: %d, Code: %d, Ident: %d\n",
+	   packet->icmp.type, packet->icmp.code, packet->icmp.ident);
+  }
+
+  close(handle);
+  return;
 }

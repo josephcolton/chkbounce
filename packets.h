@@ -5,7 +5,7 @@
  * Packet Functions *
  ********************/
 int send_icmp(char *srcip, char *dstip, unsigned char ttl, unsigned char icmp_type);
-
+void recv_icmp();
 
 
 #endif
