@@ -1,0 +1,331 @@
+.TH CHKBOUNCE 8 "2026\-05\-05" "chkbounce" "System Administration Utilities"
+.
+.SH NAME
+chkbounce \- network packet reachability tester
+.
+.SH SYNOPSIS
+.B chkbounce
+.B \-s
+.RB [ \-p
+.IR port ]
+.RB [ \-\-timeout= seconds ]
+.
+.br
+.B chkbounce
+.B \-c
+.I server
+.RB [ \-p
+.IR port ]
+.RB [ \-i [ types ]]
+.RB [ \-t [ ports ]]
+.RB [ \-u [ ports ]]
+.RB [ \-\-timeout= seconds ]
+.RB [ \-o
+.IR file ]
+.
+.SH DESCRIPTION
+.B chkbounce
+determines which types of network traffic can traverse the path between two
+hosts.
+It operates in a client/server model: the server runs persistently on the
+target machine, and clients connect to it over a TCP control channel to
+negotiate and execute a sequence of probes.
+For each probe the server opens a single socket immediately before the client
+fires the packet, then reports the result back over the control channel.
+.PP
+Supported probe types are:
+.TP
+.B ICMP
+Raw ICMP packets with a specified type number (0\(en255).
+.TP
+.B TCP
+TCP connection attempts to specified port numbers.
+.TP
+.B UDP
+UDP datagrams sent to specified port numbers.
+.PP
+Both the client and the server must be run with root privileges (or
+.BR CAP_NET_RAW )
+because ICMP probing requires a raw socket.
+.
+.SH MODES
+.TP
+.BR \-s ", " \-\-server
+Run in server mode.
+The server binds to the control port, then loops on
+.BR accept (2),
+handling one client session at a time.
+It runs until interrupted with
+.BR Ctrl\-C .
+.TP
+.BI \-c " server" "\fR,\fP \-\-client"
+Run in client mode.
+.I server
+is the hostname or dotted\-decimal IPv4 address of the machine running
+.BR chkbounce\ \-s .
+Hostnames are resolved via DNS before connecting.
+.
+.SH OPTIONS
+.TP
+.BI \-p " port" "\fR,\fP \-\-port=" port
+TCP port number used for the control channel on both sides.
+Must match between client and server.
+Default:
+.BR 1234 .
+.TP
+.BI \-\-timeout= seconds
+Per\-probe timeout in seconds.
+The server waits up to this long for each probe packet to arrive before
+reporting the probe as not received.
+Default:
+.BR 2 .
+.TP
+.RB [ \-i [ types ]] ", [" \-\-icmp [= types ]]
+Enable ICMP probes.
+.I types
+is a range list (see
+.BR "RANGE SYNTAX"
+below) of ICMP type numbers in the range 0\(en255.
+If
+.I types
+is omitted, all 256 types (0\(en255) are probed.
+.TP
+.RB [ \-t [ ports ]] ", [" \-\-tcp [= ports ]]
+Enable TCP probes.
+.I ports
+is a range list of port numbers.
+If
+.I ports
+is omitted, the default set is used:
+.BR "22, 80, 443, 8080, 8443" .
+.TP
+.RB [ \-u [ ports ]] ", [" \-\-udp [= ports ]]
+Enable UDP probes.
+.I ports
+is a range list of port numbers.
+If
+.I ports
+is omitted, the default set is used:
+.BR "53, 123, 161" .
+.TP
+.BI \-o " file" "\fR,\fP \-\-output=" file
+Write the final report to
+.I file
+in addition to printing it to standard output.
+The file is created if it does not exist and overwritten if it does.
+Progress and connection messages are not written to the file.
+.PP
+If none of
+.BR \-i ,
+.BR \-t ,
+or
+.B \-u
+is specified, the client probes all three protocols using their default lists
+(equivalent to supplying
+.B \-i \-t \-u
+with no arguments).
+.
+.SH RANGE SYNTAX
+Range lists are composed of comma\-separated values and inclusive
+.IB start \- end
+ranges.
+No spaces are allowed within a range list.
+.PP
+Examples:
+.RS
+.TP
+.B 80
+The single port 80.
+.TP
+.B 22,80,443
+Ports 22, 80, and 443.
+.TP
+.B 8080\-8090
+Ports 8080 through 8090 inclusive.
+.TP
+.B 22,25\-30,80,443
+Ports 22, 25, 26, 27, 28, 29, 30, 80, and 443.
+.TP
+.B 0,3,8\-11,255
+ICMP types 0, 3, 8, 9, 10, 11, and 255.
+.RE
+.PP
+.B Important:
+When using short options
+.RB ( \-t ,
+.BR \-u ,
+.BR \-i )
+with an explicit range list, the list must immediately follow the flag with
+.B no intervening space:
+.PP
+.RS
+.nf
+\-t80,443      # correct
+\-\-tcp=80,443  # correct
+\-t 80,443     # WRONG \(em treated as \-t (defaults) plus stray argument
+.fi
+.RE
+.
+.SH PROTOCOL
+The client and server communicate over a framed binary protocol on the TCP
+control channel.
+Each message consists of a one\-byte type field, a four\-byte big\-endian
+payload length, and the payload.
+.PP
+The session proceeds as follows:
+.RS
+.IP 1. 4
+The client connects to the server's control port.
+.IP 2.
+The client sends a
+.I negotiate
+message listing every probe it intends to run.
+.IP 3.
+The server replies
+.IR ready .
+No probe sockets are opened at this stage.
+.IP 4.
+For each probe in order:
+.RS
+.IP a. 4
+Client \(-> Server:
+.I probe\-next
+(protocol, port/type number).
+.IP b.
+Server opens the probe socket
+.RI ( listen (2)
+for TCP,
+.IR bind (2)
+for UDP, or reuses the per\-session raw socket for ICMP).
+.IP c.
+Server \(-> Client:
+.IR probe\-go .
+.IP d.
+Client sends the probe packet.
+.IP e.
+Server waits up to
+.B \-\-timeout
+seconds.
+If the probe arrives, it reports
+.I received
+immediately.
+Otherwise it reports
+.I not\-received
+after the timeout.
+Server \(-> Client:
+.IR probe\-result .
+.IP f.
+For TCP and UDP the per\-probe socket is closed.
+.RE
+.IP 5.
+Client sends
+.IR done .
+Server closes the client connection and returns to
+.BR accept (2).
+.RE
+.
+.SH EXAMPLES
+.SS Start the server on the default control port
+.nf
+sudo chkbounce \-s
+.fi
+.SS Start the server on port 5000 with a 5\-second timeout
+.nf
+sudo chkbounce \-s \-p 5000 \-\-timeout=5
+.fi
+.SS Probe all three protocols using defaults
+.nf
+sudo chkbounce \-c server.example.com
+.fi
+.SS Probe ICMP only (all 256 types)
+.nf
+sudo chkbounce \-c 192.168.1.50 \-i
+.fi
+.SS Probe specific ICMP types
+.nf
+sudo chkbounce \-c 192.168.1.50 \-i0,3,8,11
+.fi
+.SS Probe TCP on a mix of individual ports and a range
+.nf
+sudo chkbounce \-c 192.168.1.50 \-t22,80,443,8080\-8090
+.fi
+.SS Probe UDP
+.nf
+sudo chkbounce \-c 192.168.1.50 \-u53,67\-69,123,161
+.fi
+.SS Combine protocols with a custom control port and timeout
+.nf
+sudo chkbounce \-c firewall.internal \-p 5000 \-\-timeout=3 \e
+               \-i0,3,8 \-t22,80,443 \-u53,123
+.fi
+.SS Save the report to a file
+.nf
+sudo chkbounce \-c 192.168.1.50 \-t22,80,443 \-\-output=report.txt
+.fi
+.SS Combine all options including output file
+.nf
+sudo chkbounce \-c firewall.internal \-p 5000 \-\-timeout=3 \e
+               \-i0,3,8 \-t22,80,443 \-u53,123 \-\-output=/tmp/fw\-report.txt
+.fi
+.SS Loopback test (client and server on the same machine)
+.nf
+# Terminal 1
+sudo chkbounce \-s
+
+# Terminal 2
+sudo chkbounce \-c 127.0.0.1 \-t80,443 \-u53
+.fi
+.
+.SH NOTES
+.TP
+.B IPv4 only
+IPv6 is not currently supported.
+.TP
+.B One client at a time
+The server is single\-threaded and handles one client session at a time.
+A second client must wait for the current session to complete.
+.TP
+.B Privileged ports
+Binding TCP or UDP ports below 1024 on the server requires root.
+If the server cannot bind a requested port, that probe is reported as
+.I not received
+and the session continues.
+.TP
+.B NAT
+When the client is behind NAT, the server sees the NAT gateway's address
+rather than the client's private address.
+The server uses the control\-channel source IP to filter ICMP and UDP probes;
+a NAT mismatch can cause false
+.I not received
+results for those protocols.
+TCP probes are unaffected because the NAT gateway rewrites the source address
+consistently.
+.TP
+.B Host firewalls
+A firewall on the server machine (e.g.\&
+.BR iptables (8),
+.BR nftables (8))
+may drop probe packets before they reach the listening socket, producing
+false
+.I not received
+results even when the network path itself is clear.
+.
+.SH SEE ALSO
+.BR ping (8),
+.BR traceroute (8),
+.BR nmap (1),
+.BR iptables (8),
+.BR nftables (8),
+.BR raw (7),
+.BR socket (7)
+.
+.SH AUTHOR
+Joseph Colton
+.
+.SH LICENSE
+chkbounce is released under the GNU General Public License v3.0.
+See
+.B https://www.gnu.org/licenses/gpl\-3.0.html
+or the
+.B LICENSE
+file distributed with the source code.
