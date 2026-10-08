@@ -70,11 +70,11 @@ static int send_raw_icmp(const struct sockaddr_storage *dst,
 
 int send_icmp_probe(const struct sockaddr_storage *dst,
                     const struct sockaddr_storage *src,
-                    int icmp_type, uint16_t tag) {
+                    int icmp_type, int icmp_code, uint16_t tag) {
     struct icmp_send_hdr pkt;
     memset(&pkt, 0, sizeof(pkt));
     pkt.type  = (uint8_t)icmp_type;
-    pkt.code  = 0;
+    pkt.code  = (uint8_t)icmp_code;
     pkt.id    = htons(PROBE_ICMP_ID);
     pkt.seq   = htons(tag);
     memset(pkt.data, 'a', sizeof(pkt.data));
@@ -163,7 +163,7 @@ static size_t build_quote(unsigned char *buf, const struct sockaddr_storage *src
 }
 
 int send_icmp_quoted(const struct sockaddr_storage *dst,
-                     const struct sockaddr_storage *src, int icmp_type,
+                     const struct sockaddr_storage *src, int icmp_type, int icmp_code,
                      const struct sockaddr_storage *inner_src,
                      const struct sockaddr_storage *inner_dst, uint16_t tag) {
     unsigned char payload[32];
@@ -173,6 +173,7 @@ int send_icmp_quoted(const struct sockaddr_storage *dst,
     unsigned char msg[8 + 40 + 8 + sizeof(payload)];
     memset(msg, 0, 8);
     msg[0] = (uint8_t)icmp_type;
+    msg[1] = (uint8_t)icmp_code;
     size_t qlen = build_quote(msg + 8, inner_src, inner_dst, payload, plen);
     return send_raw_icmp(dst, src, msg, 8 + qlen);
 }
@@ -240,8 +241,8 @@ int send_udp_probe(const struct sockaddr_storage *dst,
 
 int send_probe(const struct sockaddr_storage *dst,
                const struct sockaddr_storage *src,
-               int proto, int number, int timeout_sec, uint16_t tag) {
-    if (proto == PROTO_ICMP) return send_icmp_probe(dst, src, number, tag);
+               int proto, int number, int code, int timeout_sec, uint16_t tag) {
+    if (proto == PROTO_ICMP) return send_icmp_probe(dst, src, number, code, tag);
     if (proto == PROTO_TCP)  return send_tcp_probe(dst, src, number, timeout_sec);
     if (proto == PROTO_UDP)  return send_udp_probe(dst, src, number, tag);
     return -1;

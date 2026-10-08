@@ -16,6 +16,7 @@
 struct result {
     int  proto;
     int  number;
+    int  code;           /* ICMP code (0 for TCP/UDP) */
     int  attempt;
     int  quoted;         /* ICMP error type sent with a quoted packet */
     int  order;          /* 1-based execution position within its round */
@@ -42,6 +43,7 @@ struct run_info {
     int         nprobes;                        /* probes per round */
     int         count;                          /* rounds requested (-n) */
     int         quote;                          /* -q given */
+    int         codes_used;                     /* some ICMP probe has code != 0 */
     int         shuffled;                       /* --shuffle given */
     unsigned long long seed;                    /* shuffle seed (if shuffled) */
     const char *const *meta;                    /* "key=value" tags (--meta) */

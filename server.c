@@ -30,6 +30,7 @@ struct session {
 static void serve_forward(struct session *s, const struct probe_next_payload *pnp) {
     int proto   = pnp->proto;
     int number  = ntohs(pnp->number);
+    int code    = pnp->code;
     int quoted  = proto == PROTO_ICMP && (pnp->flags & PROBE_FLAG_QUOTE);
     uint16_t tag = probe_tag(number, pnp->attempt, 0);
     int received = RESULT_UNAVAILABLE;   /* until a receiving socket is up */
@@ -50,7 +51,7 @@ static void serve_forward(struct session *s, const struct probe_next_payload *pn
         send_msg(s->ctrl_fd, MSG_PROBE_GO, &go, sizeof(go));
 
         if (pfd >= 0 && s->icmp_fd >= 0)
-            received = wait_icmp_quoted(s->icmp_fd, s->peer, number, pr_port,
+            received = wait_icmp_quoted(s->icmp_fd, s->peer, number, code, pr_port,
                                         2 * s->timeout_sec);
         if (pfd >= 0)
             close(pfd);
@@ -64,7 +65,8 @@ static void serve_forward(struct session *s, const struct probe_next_payload *pn
 
         /* Wait: returns as soon as the probe arrives or timeout expires */
         if (probe_fd >= 0)
-            received = wait_probe(proto, probe_fd, number, s->peer, s->timeout_sec, tag);
+            received = wait_probe(proto, probe_fd, number, code, s->peer,
+                                  s->timeout_sec, tag);
 
         /* Close per-probe socket; ICMP fd is kept open for the session */
         close_probe_socket(proto, probe_fd);
@@ -81,6 +83,7 @@ static void serve_forward(struct session *s, const struct probe_next_payload *pn
 static void serve_reverse(struct session *s, const struct probe_next_payload *pnp) {
     int proto   = pnp->proto;
     int number  = ntohs(pnp->number);
+    int code    = pnp->code;
     int quoted  = proto == PROTO_ICMP && (pnp->flags & PROBE_FLAG_QUOTE);
     uint16_t tag = probe_tag(number, pnp->attempt, 1);
     struct rprobe_sent_payload sent = { 0 };
@@ -100,13 +103,19 @@ static void serve_reverse(struct session *s, const struct probe_next_payload *pn
         }
         sa_set_port(&inner_dst, s->quote_port);
 
-        printf("Sending %s %d (quoted, %s) to %s\n", proto_name(proto, s->family),
-               number, sent.primed ? "primed" : "primer not received", s->client_ip);
-        sent.sent = send_icmp_quoted(s->peer, s->local, number,
+        printf("Sending %s %d code %d (quoted, %s) to %s\n", proto_name(proto, s->family),
+               number, code, sent.primed ? "primed" : "primer not received", s->client_ip);
+        sent.sent = send_icmp_quoted(s->peer, s->local, number, code,
                                      &inner_src, &inner_dst, tag) >= 0;
     } else {
-        printf("Sending %s %d to %s\n", proto_name(proto, s->family), number, s->client_ip);
-        sent.sent = send_probe(s->peer, s->local, proto, number, s->timeout_sec, tag) >= 0;
+        if (proto == PROTO_ICMP)
+            printf("Sending %s %d code %d to %s\n", proto_name(proto, s->family),
+                   number, code, s->client_ip);
+        else
+            printf("Sending %s %d to %s\n", proto_name(proto, s->family), number,
+                   s->client_ip);
+        sent.sent = send_probe(s->peer, s->local, proto, number, code,
+                               s->timeout_sec, tag) >= 0;
     }
     send_msg(s->ctrl_fd, MSG_RPROBE_SENT, &sent, sizeof(sent));
 }

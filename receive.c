@@ -158,7 +158,8 @@ static int next_icmp(int icmp_fd, const struct sockaddr_storage *peer,
 }
 
 static int wait_icmp(int icmp_fd, const struct sockaddr_storage *peer,
-                     int expected_type, int timeout_sec, uint16_t tag) {
+                     int expected_type, int expected_code, int timeout_sec,
+                     uint16_t tag) {
     struct timeval tv = { timeout_sec, 0 };
     unsigned char buf[4096];
     const unsigned char *m;
@@ -168,12 +169,13 @@ static int wait_icmp(int icmp_fd, const struct sockaddr_storage *peer,
     while (next_icmp(icmp_fd, peer, &tv, buf, sizeof(buf), &m, &len)) {
         uint16_t got_seq;
         memcpy(&got_seq, m + 6, 2);
-        if (m[0] == expected_type && ntohs(got_seq) == tag) {
-            printf("  ICMP type %d from %s\n", m[0], sa_ntop(peer, ip, sizeof(ip)));
+        if (m[0] == expected_type && m[1] == expected_code && ntohs(got_seq) == tag) {
+            printf("  ICMP type %d code %d from %s\n", m[0], m[1],
+                   sa_ntop(peer, ip, sizeof(ip)));
             return 1;
         }
-        printf("  ICMP type %d from %s (ignored: not this probe)\n",
-               m[0], sa_ntop(peer, ip, sizeof(ip)));
+        printf("  ICMP type %d code %d from %s (ignored: not this probe)\n",
+               m[0], m[1], sa_ntop(peer, ip, sizeof(ip)));
     }
     return 0;
 }
@@ -201,7 +203,7 @@ static int quoted_udp_sport(const unsigned char *m, size_t len) {
 }
 
 int wait_icmp_quoted(int icmp_fd, const struct sockaddr_storage *peer,
-                     int expected_type, int sport, int timeout_sec) {
+                     int expected_type, int expected_code, int sport, int timeout_sec) {
     struct timeval tv = { timeout_sec, 0 };
     unsigned char buf[4096];
     const unsigned char *m;
@@ -209,13 +211,14 @@ int wait_icmp_quoted(int icmp_fd, const struct sockaddr_storage *peer,
     char ip[INET6_ADDRSTRLEN];
 
     while (next_icmp(icmp_fd, peer, &tv, buf, sizeof(buf), &m, &len)) {
-        if (m[0] == expected_type && quoted_udp_sport(m, len) == sport) {
-            printf("  ICMP type %d (quoting UDP from port %d) from %s\n",
-                   m[0], sport, sa_ntop(peer, ip, sizeof(ip)));
+        if (m[0] == expected_type && m[1] == expected_code &&
+            quoted_udp_sport(m, len) == sport) {
+            printf("  ICMP type %d code %d (quoting UDP from port %d) from %s\n",
+                   m[0], m[1], sport, sa_ntop(peer, ip, sizeof(ip)));
             return 1;
         }
-        printf("  ICMP type %d from %s (ignored: not this probe)\n",
-               m[0], sa_ntop(peer, ip, sizeof(ip)));
+        printf("  ICMP type %d code %d from %s (ignored: not this probe)\n",
+               m[0], m[1], sa_ntop(peer, ip, sizeof(ip)));
     }
     return 0;
 }
@@ -266,12 +269,12 @@ int recv_primer(int fd, int timeout_sec, uint16_t tag, struct sockaddr_storage *
     return wait_udp(fd, NULL, timeout_sec, tag, from);
 }
 
-int wait_probe(int proto, int fd, int number, const struct sockaddr_storage *peer,
-               int timeout_sec, uint16_t tag) {
+int wait_probe(int proto, int fd, int number, int code,
+               const struct sockaddr_storage *peer, int timeout_sec, uint16_t tag) {
     char ip[INET6_ADDRSTRLEN];
     if (fd < 0) return 0;
     if (proto == PROTO_ICMP)
-        return wait_icmp(fd, peer, number, timeout_sec, tag);
+        return wait_icmp(fd, peer, number, code, timeout_sec, tag);
     if (proto == PROTO_TCP)
         return wait_tcp(fd, number, peer, timeout_sec);
     if (proto == PROTO_UDP && wait_udp(fd, peer, timeout_sec, tag, NULL)) {

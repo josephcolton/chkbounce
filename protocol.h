@@ -43,10 +43,13 @@
  * answers a type 128 probe).
  *
  *   ICMP probes:   identifier = PROBE_ICMP_ID, sequence = tag.  Receivers
- *                  check the sequence only; NATs rewrite the identifier.
+ *                  check the type, the code and the sequence (not the
+ *                  identifier, which NATs rewrite).  The tag doesn't include
+ *                  the code; the code byte itself tells codes apart.
  *   UDP probes and quote primers: payload = PROBE_MAGIC (no NUL) + tag.
- *   Quoted ICMP error probes: matched by the quoted UDP ports instead (the
- *                  4 bytes after the checksum are zero, as in a real error).
+ *   Quoted ICMP error probes: matched by type, code and the quoted UDP
+ *                  source port instead (the 4 bytes after the checksum are
+ *                  zero, as in a real error).
  */
 #define PROBE_MAGIC     "chkbounce"
 #define PROBE_MAGIC_LEN (sizeof(PROBE_MAGIC) - 1)
@@ -124,6 +127,7 @@ struct probe_next_payload {
     uint8_t  attempt; /* 0-based repeat number */
     uint8_t  flags;   /* PROBE_FLAG_* */
     uint16_t port;    /* network byte order; see above */
+    uint8_t  code;    /* ICMP code (0 for TCP/UDP) */
 };
 
 struct port_payload {

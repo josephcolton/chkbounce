@@ -84,6 +84,7 @@ static void send_next(const struct session *s, uint8_t type, const struct result
     pnp.attempt = (uint8_t)r->attempt;
     pnp.flags   = r->quoted ? PROBE_FLAG_QUOTE : 0;
     pnp.port    = htons((uint16_t)port);
+    pnp.code    = (uint8_t)r->code;
     send_msg(s->ctrl_fd, type, &pnp, sizeof(pnp));
 }
 
@@ -126,11 +127,11 @@ static int run_forward(const struct session *s, struct result *r) {
         sa_set_port(&inner_dst, qport);
         /* Without our quote port there's no flow to quote: don't send */
         sent = qfd >= 0 &&
-               send_icmp_quoted(&s->server, &s->local, r->number,
+               send_icmp_quoted(&s->server, &s->local, r->number, r->code,
                                 &inner_src, &inner_dst, tag) >= 0;
         if (qfd >= 0) close(qfd);
     } else {
-        sent = send_probe(&s->server, &s->local, r->proto, r->number,
+        sent = send_probe(&s->server, &s->local, r->proto, r->number, r->code,
                           s->timeout_sec, tag) >= 0;
     }
 
@@ -166,15 +167,15 @@ static int run_reverse(const struct session *s, struct result *r) {
             send_tagged(pfd, &s->server, s->server_quote_port, tag);
         send_next(s, MSG_RPROBE_REQ, r, pport);
         if (pfd >= 0 && s->icmp_fd >= 0)
-            received = wait_icmp_quoted(s->icmp_fd, &s->server, r->number, pport,
-                                        2 * s->timeout_sec);
+            received = wait_icmp_quoted(s->icmp_fd, &s->server, r->number, r->code,
+                                        pport, 2 * s->timeout_sec);
         if (pfd >= 0)
             close(pfd);
     } else {
         int fd = open_probe_socket(s->family, r->proto, r->number, s->icmp_fd);
         send_next(s, MSG_RPROBE_REQ, r, 0);
         if (fd >= 0)
-            received = wait_probe(r->proto, fd, r->number, &s->server,
+            received = wait_probe(r->proto, fd, r->number, r->code, &s->server,
                                   s->timeout_sec, tag);
         close_probe_socket(r->proto, fd);
     }
@@ -237,6 +238,8 @@ void run_client(const struct client_opts *o) {
     info.nprobes      = total;
     info.count        = o->count;
     info.quote        = o->quote;
+    for (int i = 0; i < o->icmp_count; i++)
+        if (o->icmp_codes[i] != 0) info.codes_used = 1;
     info.shuffled     = o->shuffle;
     info.seed         = o->seed;
     info.meta         = o->meta;
@@ -274,7 +277,8 @@ void run_client(const struct client_opts *o) {
     for (int a = 0; a < o->count; a++) {
         struct result *r = &results[a * total];
         for (int i = 0; i < o->icmp_count; i++, r++)
-            *r = (struct result){ .proto = PROTO_ICMP, .number = o->icmp_types[i] };
+            *r = (struct result){ .proto = PROTO_ICMP, .number = o->icmp_types[i],
+                                  .code = o->icmp_codes[i] };
         for (int i = 0; i < o->tcp_count; i++, r++)
             *r = (struct result){ .proto = PROTO_TCP, .number = o->tcp_ports[i] };
         for (int i = 0; i < o->udp_count; i++, r++)

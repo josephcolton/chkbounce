@@ -108,7 +108,8 @@ chkbounce -c SERVER [OPTIONS]
 | `-6`, `--ipv6` | Client: use IPv6.  Server: accept IPv6 clients only.  (By default the server accepts both.) |
 | `-p NUM`, `--port=NUM` | TCP port used for the control channel (default: **1234**) |
 | `--timeout=NUM` | Per-probe timeout in seconds (default: **2**) |
-| `-i[TYPES]`, `--icmp[=TYPES]` | Enable ICMP probes.  `TYPES` is a range list of ICMP type numbers (0–255).  Omit `TYPES` to probe all 256 types. |
+| `-i[TYPES]`, `--icmp[=TYPES]` | Enable ICMP probes.  `TYPES` is a range list of ICMP type numbers (0–255), where each item may choose codes as `TYPE:CODE` (see [Range Syntax](#range-syntax)).  Omit `TYPES` to probe all 256 types. |
+| `--code=N` | ICMP code for `-i` items that don't name one (0–255, default 0). |
 | `-t[PORTS]`, `--tcp[=PORTS]` | Enable TCP probes.  `PORTS` is a range list of port numbers.  Omit `PORTS` to use the default port list. |
 | `-u[PORTS]`, `--udp[=PORTS]` | Enable UDP probes.  `PORTS` is a range list of port numbers.  Omit `PORTS` to use the default port list. |
 | `-r`, `--reverse` | Reverse direction: the server sends each probe to the client, and the client reports what arrived |
@@ -151,6 +152,18 @@ VALUE[,VALUE|RANGE...]
 where RANGE = START-END
 ```
 
+ICMP items can also choose **codes** with `:`, as `TYPES[:CODES]`.  An item without codes uses code 0 (or `--code=N`); a range on either side expands to every combination:
+
+| Expression | Probes (type/code) |
+|------------|-----------|
+| `3,8` | 3/0, 8/0 |
+| `3:1` | 3/1 |
+| `3:0-3` | 3/0, 3/1, 3/2, 3/3 |
+| `0-255,3:1-15,4:1-2` | every type with code 0, plus 3/1…3/15 and 4/1, 4/2 |
+| `11-12:1` | 11/1, 12/1 |
+
+The ICMP list is checked strictly: anything malformed or outside 0–255 is an error.  Receivers check the code as well as the type, so a probe whose code was changed in transit counts as not received (and is logged as `ignored: not this probe`).
+
 ### Examples
 
 | Expression | Expands to |
@@ -162,7 +175,7 @@ where RANGE = START-END
 | `0,3,8-11,255` | 0, 3, 8, 9, 10, 11, 255 |
 
 Valid ranges:
-- ICMP type numbers: **0–255**
+- ICMP type and code numbers: **0–255**
 - TCP/UDP port numbers: **1–65535**
 
 ---
@@ -215,6 +228,15 @@ sudo chkbounce -c 192.168.1.50 -u53,67-69,123,161
 
 ```sh
 sudo chkbounce -c 192.168.1.50 -b -i -t22,80,443
+```
+
+### Probe specific ICMP codes
+
+```sh
+# RFC 4890 cases: Time Exceeded codes 0-1, Parameter Problem codes 0-2
+sudo chkbounce -6 -c 192.168.1.50 -b -i3:0-1,4:0-2
+# every Destination Unreachable code
+sudo chkbounce -c 192.168.1.50 -b -i3:0-15
 ```
 
 ### Compare plain and quoted ICMP errors, 5 rounds each
@@ -314,18 +336,19 @@ The receiver waits two timeouts for quoted probes, because the sender may spend 
 `--csv` writes one row per probe, attempt and direction:
 
 ```
-run_start,version,family,server_host,server_addr,client_addr,client_observed_addr,nat,timeout_sec,shuffle_seed,proto,number,quoted,attempt,order,direction,status,received,primed,probe_time,meta
-2026-10-08T16:40:01.120Z,67daed2,IPv4,198.51.100.7,198.51.100.7,10.0.0.5,203.0.113.9,1,2,42,icmp,3,1,1,17,client_to_server,received,1,1,2026-10-08T16:40:01.580Z,"provider=aws;region=us-west-2"
+run_start,version,family,server_host,server_addr,client_addr,client_observed_addr,nat,timeout_sec,shuffle_seed,proto,number,code,quoted,attempt,order,direction,status,received,primed,probe_time,meta
+2026-10-08T16:40:01.120Z,67daed2,IPv4,198.51.100.7,198.51.100.7,10.0.0.5,203.0.113.9,1,2,42,icmp,3,0,1,1,17,client_to_server,received,1,1,2026-10-08T16:40:01.580Z,"provider=aws;region=us-west-2"
 ```
 
 - `client_observed_addr` is the client's address as the server saw it; `nat` is `1` when it differs from `client_addr`.
 - `shuffle_seed` is empty unless `--shuffle` was given; `order` is the probe's 1-based position in its round.
+- `code` is the ICMP code (0 for TCP/UDP).
 - `attempt` counts from 1; `quoted` is `1` for quoted error probes; `primed` is `1`/`0` for quoted probes (did the primer reach the error sender) and empty otherwise.
 - `status` is `received`, `not_received`, or `unavailable`: the probe couldn't be set up (the receiving port was in use, a raw socket wasn't permitted, or sending failed), so it says nothing about the path.  `received` is `1`/`0`, empty when unavailable.
 - `meta` holds all `--meta` tags as `key=value;key=value` (a quoted CSV field).
 - `direction` is `client_to_server` or `server_to_client`; `proto` is `icmp`, `tcp` or `udp` (read `icmp` together with `family`: in IPv6 rows the number is an ICMPv6 type).  `client_addr` is the client's own address on the control connection; if it differs from what the server sees, the client is behind NAT.
 
-`--json` writes the same data as one object: run metadata (`version`, `start`, `end`, `family`, addresses including `client_observed_addr` and `nat`, `timeout_sec`, `count`, `quote`, `shuffle_seed` (a string, or `null`), `complete`, `directions`, and `meta` as an object), a `results` array with one entry per probe (`proto`, `number`, `quoted`, `asymmetric`, and `client_to_server` / `server_to_client` objects holding `received`, `attempts` (available attempts), `unavailable`, and a `tries` list of `{"status", "order", "time", "primed"}`, or `null` if not tested), and a `summary`.
+`--json` writes the same data as one object: run metadata (`version`, `start`, `end`, `family`, addresses including `client_observed_addr` and `nat`, `timeout_sec`, `count`, `quote`, `shuffle_seed` (a string, or `null`), `complete`, `directions`, and `meta` as an object), a `results` array with one entry per probe (`proto`, `number`, `code`, `quoted`, `asymmetric`, and `client_to_server` / `server_to_client` objects holding `received`, `attempts` (available attempts), `unavailable`, and a `tries` list of `{"status", "order", "time", "primed"}`, or `null` if not tested), and a `summary`.
 
 A probe is marked asymmetric when it arrived at least once in one direction and never in the other, so occasional loss doesn't count.  The CSV columns change between versions (most recently with `--shuffle`, `--meta`, `status` and the observed address); start a new CSV file rather than appending to one from an older version.  `version` is the `git describe` of the build, refreshed by `make` after every commit.
 

@@ -34,7 +34,8 @@ static void usage(const char *prog) {
         "  In IPv6 sessions, -i TYPES are ICMPv6 type numbers.\n"
         "\n"
         "  Ranges use comma-separated values and inclusive N-M ranges:\n"
-        "    -i0,3,8-11      ICMP types 0, 3, 8, 9, 10, 11\n"
+        "    -i0,3,8-11      ICMP types 0, 3, 8, 9, 10, 11 (code 0, or --code)\n"
+        "    -i3:0-15,4:1-2  Type 3 codes 0-15, and type 4 codes 1 and 2\n"
         "    -t22,80,443     TCP ports 22, 80, 443\n"
         "    -u53,123-130    UDP ports 53, 123 through 130\n"
         "\n"
@@ -45,7 +46,9 @@ static void usage(const char *prog) {
         "  -6, --ipv6             Use IPv6 only (server: accept IPv6 clients only)\n"
         "  -p, --port=NUM         Control channel TCP port (default: %d)\n"
         "      --timeout=NUM      Per-probe timeout in seconds (default: %d)\n"
-        "  -i[TYPES], --icmp[=TYPES]  ICMP type probes (default: 0-255)\n"
+        "  -i[TYPES], --icmp[=TYPES]  ICMP type probes (default: 0-255); TYPE:CODE\n"
+        "                             items choose codes\n"
+        "             --code=N        Code for ICMP items without one (default 0)\n"
         "  -t[PORTS], --tcp[=PORTS]   TCP port probes  (default: %s)\n"
         "  -u[PORTS], --udp[=PORTS]   UDP port probes  (default: %s)\n"
         "  -r,        --reverse       Server sends probes to client (server -> client)\n"
@@ -85,6 +88,78 @@ static unsigned long long random_seed(void) {
     unsigned long long v;
     if (getrandom(&v, sizeof(v), 0) == (ssize_t)sizeof(v)) return v;
     return (unsigned long long)time(NULL) ^ ((unsigned long long)getpid() << 32);
+}
+
+/*
+ * Parse "N" or "N-M" (inclusive, each 0..255) at *p; advance *p past it.
+ * Returns 0 on success, -1 on a malformed or out-of-range span.
+ */
+static int parse_span(const char **p, int *lo, int *hi) {
+    char *end;
+    if (!isdigit((unsigned char)**p)) return -1;
+    long a = strtol(*p, &end, 10), b = a;
+    if (*end == '-') {
+        const char *q = end + 1;
+        if (!isdigit((unsigned char)*q)) return -1;
+        b = strtol(q, &end, 10);
+    }
+    if (a < 0 || b > 255 || a > b) return -1;
+    *lo = (int)a; *hi = (int)b; *p = end;
+    return 0;
+}
+
+/*
+ * Parse an ICMP list: comma-separated items TYPES[:CODES], where TYPES and
+ * CODES are "N" or "N-M" (0..255).  Items without CODES use default_code.
+ * Expands to parallel malloc'd arrays of (type, code), type-major.
+ * Returns 0 on success, -1 (with a message) on a syntax error.
+ */
+static int parse_icmp_list(const char *str, int default_code,
+                           int **types, int **codes, int *count) {
+    int n = 0, cap = 64;
+    int *t = malloc(cap * sizeof(int)), *c = malloc(cap * sizeof(int));
+    const char *p = str, *item = str;
+    if (!t || !c) goto fail;
+
+    while (*p) {
+        int tlo, thi, clo = default_code, chi = default_code;
+        item = p;
+        if (parse_span(&p, &tlo, &thi) < 0) goto bad;
+        if (*p == ':') {
+            p++;
+            if (parse_span(&p, &clo, &chi) < 0) goto bad;
+        }
+        if (*p != ',' && *p != '\0') goto bad;
+        for (int ty = tlo; ty <= thi; ty++)
+            for (int co = clo; co <= chi; co++) {
+                if (n == cap) {
+                    cap *= 2;
+                    int *nt = realloc(t, cap * sizeof(int));
+                    if (!nt) goto fail;
+                    t = nt;
+                    int *nc = realloc(c, cap * sizeof(int));
+                    if (!nc) goto fail;
+                    c = nc;
+                }
+                t[n] = ty; c[n] = co; n++;
+            }
+        if (*p == ',') {
+            p++;
+            if (!*p) { item = "(trailing comma)"; goto bad; }
+        }
+    }
+    if (n == 0) {
+        fprintf(stderr, "Empty ICMP list\n");
+        goto fail;
+    }
+    *types = t; *codes = c; *count = n;
+    return 0;
+bad:
+    fprintf(stderr, "Invalid ICMP list at '%s': use TYPE[-TYPE][:CODE[-CODE]],... "
+                    "with values 0-255\n", item);
+fail:
+    free(t); free(c);
+    return -1;
 }
 
 /*
@@ -151,6 +226,7 @@ int main(int argc, char **argv) {
     int   family       = AF_UNSPEC;
     int   count        = 1;
     int   quote        = 0;
+    int   default_code = 0;
     int   do_shuffle   = 0;
     unsigned long long seed = 0;
     const char *meta[MAX_META];
@@ -179,6 +255,7 @@ int main(int argc, char **argv) {
         { "quote",   no_argument,       NULL, 'q' },
         { "shuffle", optional_argument, NULL, 'S' },
         { "meta",    required_argument, NULL, 'm' },
+        { "code",    required_argument, NULL, 'K' },
         { NULL, 0, NULL, 0 }
     };
 
@@ -202,6 +279,16 @@ int main(int argc, char **argv) {
         case 'J': json_file = optarg; break;
         case 'n': count = atoi(optarg); break;
         case 'q': quote = 1;            break;
+        case 'K': {
+            char *end;
+            long v = strtol(optarg, &end, 10);
+            if (!*optarg || *end || v < 0 || v > 255) {
+                fprintf(stderr, "Invalid code: %s (must be 0-255)\n", optarg);
+                return 1;
+            }
+            default_code = (int)v;
+            break;
+        }
         case 'S':
             do_shuffle = 1;
             if (optarg) {
@@ -280,9 +367,11 @@ int main(int argc, char **argv) {
     }
 
     int  icmp_count = 0, tcp_count = 0, udp_count = 0;
-    int *icmp_types = NULL, *tcp_ports = NULL, *udp_ports = NULL;
+    int *icmp_types = NULL, *icmp_codes = NULL, *tcp_ports = NULL, *udp_ports = NULL;
 
-    if (icmp_str) icmp_types = parse_range_list(icmp_str, &icmp_count);
+    if (icmp_str && parse_icmp_list(icmp_str, default_code,
+                                    &icmp_types, &icmp_codes, &icmp_count) < 0)
+        return 1;
     if (tcp_str)  tcp_ports  = parse_range_list(tcp_str,  &tcp_count);
     if (udp_str)  udp_ports  = parse_range_list(udp_str,  &udp_count);
 
@@ -293,6 +382,7 @@ int main(int argc, char **argv) {
         .family       = family,
         .directions   = directions,
         .icmp_types   = icmp_types, .icmp_count = icmp_count,
+        .icmp_codes   = icmp_codes,
         .tcp_ports    = tcp_ports,  .tcp_count  = tcp_count,
         .udp_ports    = udp_ports,  .udp_count  = udp_count,
         .count        = count,
@@ -308,6 +398,7 @@ int main(int argc, char **argv) {
     run_client(&o);
 
     free(icmp_types);
+    free(icmp_codes);
     free(tcp_ports);
     free(udp_ports);
     return 0;

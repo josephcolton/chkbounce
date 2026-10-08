@@ -14,6 +14,7 @@ struct client_opts {
     int   directions;          /* DIR_* bitmask; with DIR_BOTH each probe runs
                                   forward then immediately in reverse */
     int  *icmp_types; int icmp_count;   /* ICMP (or ICMPv6) type numbers */
+    int  *icmp_codes;                   /* code for each entry of icmp_types */
     int  *tcp_ports;  int tcp_count;
     int  *udp_ports;  int udp_count;
     int   count;               /* attempts per probe (-n), 1..MAX_ATTEMPTS; the

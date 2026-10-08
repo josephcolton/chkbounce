@@ -130,8 +130,10 @@ static void print_section(const struct result *results, int proto,
     char b1[48], b2[48];   /* "%d/%d +%d unavail" with any int values */
 
     rprintf(outfile, "\n%s Probes:\n", proto_name(proto, info->family));
+    int idw = (int)strlen(label) + 1 + width +
+              (proto == PROTO_ICMP && info->codes_used ? 9 : 0);
     if (directions == DIR_BOTH)
-        rprintf(outfile, "  %*s  %-16s %-16s\n", (int)strlen(label) + width + 2, "",
+        rprintf(outfile, "  %*s   %-16s %-16s\n", idw, "",
                 "client->server", "server->client");
 
     for (int i = 0; i < info->nprobes; i++) {
@@ -140,13 +142,18 @@ static void print_section(const struct result *results, int proto,
         struct agg a = aggregate(info, results, i);
         if (!ran(&a.fwd) && !ran(&a.rev)) continue;     /* never reached */
         const char *q = r->quoted ? " [quoted]" : "";
+        char id[32];
+        if (proto == PROTO_ICMP && info->codes_used)
+            snprintf(id, sizeof(id), "%s %*d code %3d", label, width, r->number, r->code);
+        else
+            snprintf(id, sizeof(id), "%s %*d", label, width, r->number);
         if (directions == DIR_BOTH)
-            rprintf(outfile, "  %s %*d:  %-16s %-16s%s%s\n", label, width, r->number,
+            rprintf(outfile, "  %s:  %-16s %-16s%s%s\n", id,
                     status(&a.fwd, info->count, b1, sizeof(b1)),
                     status(&a.rev, info->count, b2, sizeof(b2)),
                     asymmetric(&a) ? " ASYMMETRIC" : "", q);
         else
-            rprintf(outfile, "  %s %*d: %s%s\n", label, width, r->number,
+            rprintf(outfile, "  %s: %s%s\n", id,
                     status(directions == DIR_FORWARD ? &a.fwd : &a.rev,
                            info->count, b1, sizeof(b1)), q);
     }
@@ -232,11 +239,11 @@ static void csv_row(FILE *f, const struct run_info *info, const struct result *r
                          : outcome == RESULT_LOST     ? "0" : "";
     const char *primed_s = primed < 0 ? "" : primed ? "1" : "0";
 
-    fprintf(f, "%s,%s,%s,%s,%s,%s,%s,%d,%d,%s,%s,%d,%d,%d,%d,%s,%s,%s,%s,%s,",
+    fprintf(f, "%s,%s,%s,%s,%s,%s,%s,%d,%d,%s,%s,%d,%d,%d,%d,%d,%s,%s,%s,%s,%s,",
             info->start, CHKBOUNCE_VERSION, family_name(info->family),
             info->server_host, info->server_addr, info->client_addr,
             info->client_observed_addr, behind_nat(info), info->timeout_sec, seed,
-            proto_key(r->proto), r->number, r->quoted, r->attempt + 1, r->order,
+            proto_key(r->proto), r->number, r->code, r->quoted, r->attempt + 1, r->order,
             direction, result_key(outcome), received, primed_s, time);
     csv_meta(f, info);
     fputc('\n', f);
@@ -252,7 +259,7 @@ int write_csv(const char *path, const struct run_info *info,
     if (ftell(f) == 0)
         fprintf(f, "run_start,version,family,server_host,server_addr,client_addr,"
                    "client_observed_addr,nat,timeout_sec,shuffle_seed,proto,number,"
-                   "quoted,attempt,order,direction,status,received,primed,"
+                   "code,quoted,attempt,order,direction,status,received,primed,"
                    "probe_time,meta\n");
 
     for (int i = 0; i < nres(info); i++) {
@@ -361,9 +368,9 @@ int write_json(const char *path, const struct run_info *info,
         add_dir(&tot.rev, &a.rev);
         asym += asymmetric(&a);
 
-        fprintf(f, "%s\n    {\"proto\": \"%s\", \"number\": %d, \"quoted\": %s, "
-                   "\"client_to_server\": ",
-                first ? "" : ",", proto_key(r->proto), r->number,
+        fprintf(f, "%s\n    {\"proto\": \"%s\", \"number\": %d, \"code\": %d, "
+                   "\"quoted\": %s, \"client_to_server\": ",
+                first ? "" : ",", proto_key(r->proto), r->number, r->code,
                 r->quoted ? "true" : "false");
         json_dir(f, info, results, i, 0);
         fputs(", \"server_to_client\": ", f);

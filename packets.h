@@ -13,21 +13,21 @@
  */
 
 /*
- * Send a single ICMP (AF_INET) or ICMPv6 (AF_INET6) packet of the given type,
- * tagged in the sequence field.  Returns bytes sent or -1.
+ * Send a single ICMP (AF_INET) or ICMPv6 (AF_INET6) packet of the given type
+ * and code, tagged in the sequence field.  Returns bytes sent or -1.
  */
 int send_icmp_probe(const struct sockaddr_storage *dst,
                     const struct sockaddr_storage *src,
-                    int icmp_type, uint16_t tag);
+                    int icmp_type, int icmp_code, uint16_t tag);
 
 /*
- * Send an ICMP/ICMPv6 error of the given type (code 0) that quotes a UDP
+ * Send an ICMP/ICMPv6 error of the given type and code that quotes a UDP
  * datagram inner_src -> inner_dst (addresses and ports) carrying
  * PROBE_MAGIC + tag, i.e. the primer the receiver sent us.
  * Returns bytes sent or -1.
  */
 int send_icmp_quoted(const struct sockaddr_storage *dst,
-                     const struct sockaddr_storage *src, int icmp_type,
+                     const struct sockaddr_storage *src, int icmp_type, int icmp_code,
                      const struct sockaddr_storage *inner_src,
                      const struct sockaddr_storage *inner_dst, uint16_t tag);
 
@@ -45,11 +45,12 @@ int send_udp_probe(const struct sockaddr_storage *dst,
 
 /*
  * Send one probe of the given PROTO_* type.  number is the ICMP type or the
- * TCP/UDP port.  Return value is that of the per-protocol function above.
+ * TCP/UDP port; code is the ICMP code (ignored for TCP/UDP).  Return value is
+ * that of the per-protocol function above.
  */
 int send_probe(const struct sockaddr_storage *dst,
                const struct sockaddr_storage *src,
-               int proto, int number, int timeout_sec, uint16_t tag);
+               int proto, int number, int code, int timeout_sec, uint16_t tag);
 
 /*
  * UDP socket bound to local's address and an ephemeral port, returned in

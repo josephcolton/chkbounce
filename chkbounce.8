@@ -47,7 +47,7 @@ fires the packet, then reports the result back over the control channel.
 Supported probe types are:
 .TP
 .B ICMP
-Raw ICMP packets (ICMPv6 in IPv6 sessions) with a specified type number (0\(en255).
+Raw ICMP packets (ICMPv6 in IPv6 sessions) with a specified type and code (0\(en255 each).
 .TP
 .B TCP
 TCP connection attempts to specified port numbers.
@@ -124,10 +124,18 @@ Enable ICMP probes.
 .I types
 is a range list (see
 .BR "RANGE SYNTAX"
-below) of ICMP type numbers in the range 0\(en255.
+below) of ICMP type numbers in the range 0\(en255; items may choose codes
+as
+.IR type : code .
 If
 .I types
 is omitted, all 256 types (0\(en255) are probed.
+.TP
+.BI \-\-code= n
+ICMP code (0\(en255) for
+.B \-i
+items that don't choose one.
+Default: 0.
 .TP
 .RB [ \-t [ ports ]] ", [" \-\-tcp [= ports ]]
 Enable TCP probes.
@@ -211,7 +219,7 @@ Append results to
 as CSV, one row per probe and direction, with the columns
 .IR run_start ", " version ", " family ", " server_host ", " server_addr ", "
 .IR client_addr ", " client_observed_addr ", " nat ", " timeout_sec ", "
-.IR shuffle_seed ", " proto ", " number ", " quoted ", " attempt ", " order ", "
+.IR shuffle_seed ", " proto ", " number ", " code ", " quoted ", " attempt ", " order ", "
 .IR direction ", " status ", " received ", " primed ", " probe_time ", " meta .
 .I status
 is
@@ -265,6 +273,24 @@ Ports 22, 25, 26, 27, 28, 29, 30, 80, and 443.
 .B 0,3,8\-11,255
 ICMP types 0, 3, 8, 9, 10, 11, and 255.
 .RE
+.PP
+ICMP items may also choose codes, as
+.IR types [: codes ],
+where both parts are a value or an inclusive range (0\(en255).
+Items without codes use code 0, or the value of
+.BR \-\-code .
+A range on either side expands to every combination:
+.RS
+.TP
+.B 3:0\-3
+Type 3 with codes 0, 1, 2 and 3.
+.TP
+.B 0\-255,3:1\-15,4:1\-2
+Every type with code 0, plus type 3 codes 1\(en15 and type 4 codes 1 and 2.
+.RE
+.PP
+Receivers check the code as well as the type, so a probe whose code changed
+in transit is not counted as received.
 .PP
 .B Important:
 When using short options
