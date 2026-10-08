@@ -87,10 +87,13 @@ static void send_next(const struct session *s, uint8_t type, const struct result
     send_msg(s->ctrl_fd, type, &pnp, sizeof(pnp));
 }
 
-/* Client sends the probe; the server reports whether it arrived. */
+/*
+ * Client sends the probe; the server reports whether it arrived.
+ * Returns a RESULT_* value, or -1 on a control-channel error.
+ */
 static int run_forward(const struct session *s, struct result *r) {
     uint16_t tag = probe_tag(r->number, r->attempt, 0);
-    int qfd = -1, qport = 0;
+    int qfd = -1, qport = 0, sent;
 
     /* Quoted: we are the error sender, so open the port the primer comes to */
     if (r->quoted)
@@ -121,10 +124,14 @@ static int run_forward(const struct session *s, struct result *r) {
             sa_set_port(&inner_src, primer_port);
         }
         sa_set_port(&inner_dst, qport);
-        send_icmp_quoted(&s->server, &s->local, r->number, &inner_src, &inner_dst, tag);
+        /* Without our quote port there's no flow to quote: don't send */
+        sent = qfd >= 0 &&
+               send_icmp_quoted(&s->server, &s->local, r->number,
+                                &inner_src, &inner_dst, tag) >= 0;
         if (qfd >= 0) close(qfd);
     } else {
-        send_probe(&s->server, &s->local, r->proto, r->number, s->timeout_sec, tag);
+        sent = send_probe(&s->server, &s->local, r->proto, r->number,
+                          s->timeout_sec, tag) >= 0;
     }
 
     payload = NULL;
@@ -136,13 +143,16 @@ static int run_forward(const struct session *s, struct result *r) {
     }
     int received = ((struct probe_result_payload *)payload)->received;
     free(payload);
-    return received;
+    return sent ? received : RESULT_UNAVAILABLE;
 }
 
-/* Client listens; the server sends the probe and says when it has done so. */
+/*
+ * Client listens; the server sends the probe and says when it has done so.
+ * Returns a RESULT_* value, or -1 on a control-channel error.
+ */
 static int run_reverse(const struct session *s, struct result *r) {
     uint16_t tag = probe_tag(r->number, r->attempt, 1);
-    int received = 0;
+    int received = RESULT_UNAVAILABLE;   /* until a receiving socket is up */
 
     if (r->quoted) {
         /*
@@ -155,15 +165,17 @@ static int run_reverse(const struct session *s, struct result *r) {
         if (pfd >= 0 && s->server_quote_port)
             send_tagged(pfd, &s->server, s->server_quote_port, tag);
         send_next(s, MSG_RPROBE_REQ, r, pport);
-        if (pfd >= 0) {
+        if (pfd >= 0 && s->icmp_fd >= 0)
             received = wait_icmp_quoted(s->icmp_fd, &s->server, r->number, pport,
                                         2 * s->timeout_sec);
+        if (pfd >= 0)
             close(pfd);
-        }
     } else {
         int fd = open_probe_socket(s->family, r->proto, r->number, s->icmp_fd);
         send_next(s, MSG_RPROBE_REQ, r, 0);
-        received = wait_probe(r->proto, fd, r->number, &s->server, s->timeout_sec, tag);
+        if (fd >= 0)
+            received = wait_probe(r->proto, fd, r->number, &s->server,
+                                  s->timeout_sec, tag);
         close_probe_socket(r->proto, fd);
     }
 
@@ -173,10 +185,33 @@ static int run_reverse(const struct session *s, struct result *r) {
                 proto_name(r->proto, s->family), r->number);
         return -1;
     }
+    struct rprobe_sent_payload *sp = payload;
     if (r->quoted)
-        r->rev_primed = payload ? ((struct rprobe_sent_payload *)payload)->primed : 0;
+        r->rev_primed = sp ? sp->primed : 0;
+    int sent = sp ? sp->sent : 0;
     free(payload);
-    return received;
+    return sent ? received : RESULT_UNAVAILABLE;
+}
+
+/* ------------------------------------------------------------------ shuffling */
+
+/*
+ * splitmix64: a small, fully specified PRNG, so a recorded seed reproduces
+ * the same probe order on any platform (unlike rand()/random()).
+ */
+static uint64_t splitmix64(uint64_t *state) {
+    uint64_t z = (*state += 0x9E3779B97F4A7C15ULL);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+}
+
+/* Fisher-Yates shuffle of order[0..n-1] (modulo bias is negligible at 64 bits) */
+static void shuffle(int *order, int n, uint64_t *state) {
+    for (int i = n - 1; i > 0; i--) {
+        int j = (int)(splitmix64(state) % (uint64_t)(i + 1));
+        int t = order[i]; order[i] = order[j]; order[j] = t;
+    }
 }
 
 /* ----------------------------------------------------------------- run_client */
@@ -202,6 +237,10 @@ void run_client(const struct client_opts *o) {
     info.nprobes      = total;
     info.count        = o->count;
     info.quote        = o->quote;
+    info.shuffled     = o->shuffle;
+    info.seed         = o->seed;
+    info.meta         = o->meta;
+    info.nmeta        = o->nmeta;
 
     /* Resolve once; -4/-6 restrict the family, otherwise the resolver picks */
     if (resolve_host(o->server_host, o->family, &s.server) < 0)
@@ -264,7 +303,13 @@ void run_client(const struct client_opts *o) {
         free(results);
         return;
     }
-    s.server_quote_port = payload ? ntohs(((struct port_payload *)payload)->port) : 0;
+    struct ready_payload *rp = payload;
+    s.server_quote_port = rp ? ntohs(rp->port) : 0;
+    if (rp) {
+        rp->observed_addr[sizeof(rp->observed_addr) - 1] = '\0';
+        snprintf(info.client_observed_addr, sizeof(info.client_observed_addr),
+                 "%s", rp->observed_addr);
+    }
     free(payload);
 
     if (o->count > 1)
@@ -277,20 +322,39 @@ void run_client(const struct client_opts *o) {
     if ((o->directions & DIR_REVERSE) && o->icmp_count > 0)
         s.icmp_fd = open_icmp_raw(s.family);
 
-    int done = 0;
-    for (; done < nres; done++) {
-        struct result *r = &results[done];
-        if (o->directions & DIR_FORWARD) {
-            r->fwd = run_forward(&s, r);
-            if (r->fwd < 0) break;
-            timestamp_utc(r->fwd_time, sizeof(r->fwd_time));
-        }
-        if (o->directions & DIR_REVERSE) {
-            r->rev = run_reverse(&s, r);
-            if (r->rev < 0) break;
-            timestamp_utc(r->rev_time, sizeof(r->rev_time));
+    /*
+     * Each round runs every probe once, in list order or (with --shuffle) in
+     * a fresh seeded permutation; with -b a probe's two directions stay
+     * back to back.  On a control-channel error the rest are left untested.
+     */
+    int *order = malloc(total * sizeof(*order));
+    if (!order) { close(s.ctrl_fd); free(results); return; }
+    uint64_t rng = o->seed;
+
+    int done = 0, failed = 0;
+    for (int a = 0; a < o->count && !failed; a++) {
+        for (int i = 0; i < total; i++) order[i] = i;
+        if (o->shuffle) shuffle(order, total, &rng);
+
+        for (int k = 0; k < total && !failed; k++) {
+            struct result *r = &results[a * total + order[k]];
+            r->order = k + 1;
+            if (o->directions & DIR_FORWARD) {
+                int v = run_forward(&s, r);
+                if (v < 0) { failed = 1; break; }
+                r->fwd = v;
+                timestamp_utc(r->fwd_time, sizeof(r->fwd_time));
+            }
+            if (o->directions & DIR_REVERSE) {
+                int v = run_reverse(&s, r);
+                if (v < 0) { failed = 1; break; }
+                r->rev = v;
+                timestamp_utc(r->rev_time, sizeof(r->rev_time));
+            }
+            done++;
         }
     }
+    free(order);
     timestamp_utc(info.end, sizeof(info.end));
     if (s.icmp_fd >= 0) close(s.icmp_fd);
     send_msg(s.ctrl_fd, MSG_DONE, NULL, 0);

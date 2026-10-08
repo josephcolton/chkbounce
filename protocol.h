@@ -18,6 +18,17 @@
 #define MSG_RPROBE_REQ   7   /* client->server: send me this probe (reverse) */
 #define MSG_RPROBE_SENT  8   /* server->client: reverse probe has been sent */
 
+/*
+ * Outcome of one probe in one direction (probe_result_payload.received and
+ * the client's results).  UNAVAILABLE means the probe could not be set up
+ * (the receiver couldn't open its socket, e.g. the port is in use or a raw
+ * socket isn't permitted, or the sender couldn't send), so it says nothing
+ * about the path and must not be counted as a drop.
+ */
+#define RESULT_LOST        0
+#define RESULT_RECEIVED    1
+#define RESULT_UNAVAILABLE 2
+
 /* probe_next_payload.flags */
 #define PROBE_FLAG_QUOTE 0x01  /* ICMP error type: send with a quoted packet */
 
@@ -59,8 +70,9 @@ static inline uint16_t probe_tag(int number, int attempt, int reverse) {
  *   [4 bytes: count][count * probe_entry]
  *   probe_entry = [1 byte: proto][2 bytes: number]
  *
- * MSG_READY payload: port_payload, the server's session UDP port that
- *   receives quote primers (0 if unavailable).
+ * MSG_READY payload: ready_payload: the server's session UDP port that
+ *   receives quote primers (0 if unavailable), and the client's address as
+ *   the server sees it (differs from the client's own address behind NAT).
  *
  * MSG_PROBE_NEXT / MSG_RPROBE_REQ payload: probe_next_payload.  port is the
  *   client's UDP port for quoted probes: in PROBE_NEXT the port the primer
@@ -118,14 +130,20 @@ struct port_payload {
     uint16_t port;    /* network byte order */
 };
 
+struct ready_payload {
+    uint16_t port;              /* network byte order */
+    char     observed_addr[46]; /* numeric, NUL-terminated (INET6_ADDRSTRLEN) */
+};
+
 struct probe_result_payload {
     uint8_t  proto;
     uint16_t number;   /* network byte order */
-    uint8_t  received; /* 1 = received, 0 = not */
+    uint8_t  received; /* RESULT_* */
 };
 
 struct rprobe_sent_payload {
     uint8_t  primed;   /* quoted probe: 1 if the client's primer arrived */
+    uint8_t  sent;     /* 1 if the server sent the probe, 0 if it couldn't */
 };
 
 #pragma pack(pop)

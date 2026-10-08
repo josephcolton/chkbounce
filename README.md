@@ -117,6 +117,8 @@ chkbounce -c SERVER [OPTIONS]
 | `--csv=FILE` | Append results to `FILE` as CSV, one row per probe and direction.  A header row is written if the file is new or empty, so many runs can be collected in one file. |
 | `-n N`, `--count=N` | Sweep the whole probe list `N` times (1–127, default 1).  Rounds are spread over the run rather than repeated back to back.  Reports show `k/N` per probe. |
 | `-q`, `--quote` | Send ICMP **error** types (ICMPv4 3, 4, 5, 11, 12, 31, 40; all ICMPv6 types below 128) as quoted errors; see [Quoted error probes](#quoted-error-probes).  Other types and TCP/UDP probes are unchanged. |
+| `--shuffle[=SEED]` | Randomize the probe order in every round, to rule out order effects (stateful middleboxes, rate limiters).  The seed is printed and recorded in CSV/JSON; pass the same `SEED` to reproduce an order exactly.  Without a value, a random seed is chosen. |
+| `-m KEY=VALUE`, `--meta=KEY=VALUE` | Record a tag with the results, e.g. `-m provider=aws -m region=us-west-2`.  Repeatable (up to 32).  `KEY` is letters, digits, `_`, `.`, `-`. |
 | `--json=FILE` | Write the run (metadata, per-probe results, summary) to `FILE` as one JSON document.  The file is overwritten. |
 | `-V`, `--version` | Print the version (the git commit it was built from) and exit. |
 
@@ -312,15 +314,20 @@ The receiver waits two timeouts for quoted probes, because the sender may spend 
 `--csv` writes one row per probe, attempt and direction:
 
 ```
-run_start,version,family,server_host,server_addr,client_addr,timeout_sec,proto,number,quoted,attempt,direction,received,primed,probe_time
-2026-10-08T15:45:27.697Z,21dafa7,IPv4,127.0.0.1,127.0.0.1,127.0.0.1,1,icmp,3,1,1,client_to_server,1,1,2026-10-08T15:45:28.110Z
+run_start,version,family,server_host,server_addr,client_addr,client_observed_addr,nat,timeout_sec,shuffle_seed,proto,number,quoted,attempt,order,direction,status,received,primed,probe_time,meta
+2026-10-08T16:40:01.120Z,67daed2,IPv4,198.51.100.7,198.51.100.7,10.0.0.5,203.0.113.9,1,2,42,icmp,3,1,1,17,client_to_server,received,1,1,2026-10-08T16:40:01.580Z,"provider=aws;region=us-west-2"
 ```
 
-`attempt` counts from 1; `quoted` is `1` for quoted error probes; `primed` is `1`/`0` for quoted probes (did the primer reach the error sender) and empty otherwise; `direction` is `client_to_server` or `server_to_client`; `received` is `1` or `0`; `proto` is `icmp`, `tcp` or `udp` (read `icmp` together with `family`: in IPv6 rows the number is an ICMPv6 type).  `client_addr` is the client's own address on the control connection; if it differs from what the server sees, the client is behind NAT.
+- `client_observed_addr` is the client's address as the server saw it; `nat` is `1` when it differs from `client_addr`.
+- `shuffle_seed` is empty unless `--shuffle` was given; `order` is the probe's 1-based position in its round.
+- `attempt` counts from 1; `quoted` is `1` for quoted error probes; `primed` is `1`/`0` for quoted probes (did the primer reach the error sender) and empty otherwise.
+- `status` is `received`, `not_received`, or `unavailable`: the probe couldn't be set up (the receiving port was in use, a raw socket wasn't permitted, or sending failed), so it says nothing about the path.  `received` is `1`/`0`, empty when unavailable.
+- `meta` holds all `--meta` tags as `key=value;key=value` (a quoted CSV field).
+- `direction` is `client_to_server` or `server_to_client`; `proto` is `icmp`, `tcp` or `udp` (read `icmp` together with `family`: in IPv6 rows the number is an ICMPv6 type).  `client_addr` is the client's own address on the control connection; if it differs from what the server sees, the client is behind NAT.
 
-`--json` writes the same data as one object: run metadata (`version`, `start`, `end`, `family`, addresses, `timeout_sec`, `count`, `quote`, `complete`, `directions`), a `results` array with one entry per probe (`proto`, `number`, `quoted`, `asymmetric`, and `client_to_server` / `server_to_client` objects holding `received`, `attempts` and a `tries` list of `{"received", "time", "primed"}`, or `null` if not tested), and a `summary`.
+`--json` writes the same data as one object: run metadata (`version`, `start`, `end`, `family`, addresses including `client_observed_addr` and `nat`, `timeout_sec`, `count`, `quote`, `shuffle_seed` (a string, or `null`), `complete`, `directions`, and `meta` as an object), a `results` array with one entry per probe (`proto`, `number`, `quoted`, `asymmetric`, and `client_to_server` / `server_to_client` objects holding `received`, `attempts` (available attempts), `unavailable`, and a `tries` list of `{"status", "order", "time", "primed"}`, or `null` if not tested), and a `summary`.
 
-A probe is marked asymmetric when it arrived at least once in one direction and never in the other, so occasional loss doesn't count.  The CSV columns changed when `-n`/`-q` were added; start a new CSV file rather than appending to one from an older version.
+A probe is marked asymmetric when it arrived at least once in one direction and never in the other, so occasional loss doesn't count.  The CSV columns change between versions (most recently with `--shuffle`, `--meta`, `status` and the observed address); start a new CSV file rather than appending to one from an older version.  `version` is the `git describe` of the build, refreshed by `make` after every commit.
 
 ## Sample Output
 
@@ -358,7 +365,7 @@ Summary: client->server 4 of 9 received
 - **One family per session** — To compare IPv4 and IPv6 on a dual-stack path, run the client twice (`-4` and `-6`) against the same server.
 - **Sequential clients** — The server handles one client at a time.  A second client must wait until the current session completes.
 - **Privileges required** — Both client and server need `CAP_NET_RAW` for ICMP raw sockets (granted by `make install`, or run as root).
-- **Privileged ports** — Binding TCP or UDP ports below 1024 requires `CAP_NET_BIND_SERVICE` (granted by `make install`) or root.  If the receiving side cannot bind a probe port (no privilege, or a local service already holds it), the probe is reported as *not received*, the same as a filtered probe.
+- **Privileged ports** — Binding TCP or UDP ports below 1024 requires `CAP_NET_BIND_SERVICE` (granted by `make install`) or root.  If the receiving side cannot bind a probe port (no privilege, or a local service already holds it), the probe is reported as *unavailable* and left out of the received/tested counts.
 - **NAT** — If the client is behind NAT, the server sees the NAT gateway's IP, which may not match the source IP of raw ICMP packets sent by the client.  TCP and UDP probes are unaffected because the kernel handles their source IP assignment correctly through the NAT mapping.
 - **Reverse probes and NAT** — Reverse probes are sent to the client's public (NAT) address, so they will generally not reach a client behind NAT unless the NAT forwards them.
 - **Version compatibility** — Client and server should be built from the same version.  `-r` and `-b` need a server built with reverse-probe support (an older server ignores the request and the client hangs), and the probe tags and control messages change between versions.

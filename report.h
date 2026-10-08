@@ -7,8 +7,9 @@
 
 /*
  * One attempt at one probe.  Results are stored round by round: entry
- * attempt * nprobes + i is attempt `attempt` of probe i.
- * fwd/rev: 1 = received, 0 = not received, -1 = not tested.
+ * attempt * nprobes + i is attempt `attempt` of probe i (execution order
+ * within a round may differ; see `order`).
+ * fwd/rev: RESULT_* from protocol.h, or -1 = not tested.
  * fwd_primed/rev_primed (quoted probes only): 1 if the receiver's primer
  * reached the error sender, 0 if not, -1 if not applicable.
  */
@@ -17,6 +18,7 @@ struct result {
     int  number;
     int  attempt;
     int  quoted;         /* ICMP error type sent with a quoted packet */
+    int  order;          /* 1-based execution position within its round */
     int  fwd;
     int  rev;
     int  fwd_primed;
@@ -32,6 +34,7 @@ struct run_info {
     const char *server_host;
     char        server_addr[INET6_ADDRSTRLEN];
     char        client_addr[INET6_ADDRSTRLEN];  /* local end of control connection */
+    char        client_observed_addr[INET6_ADDRSTRLEN]; /* as the server saw it */
     int         family;
     int         control_port;
     int         timeout_sec;
@@ -39,11 +42,15 @@ struct run_info {
     int         nprobes;                        /* probes per round */
     int         count;                          /* rounds requested (-n) */
     int         quote;                          /* -q given */
+    int         shuffled;                       /* --shuffle given */
+    unsigned long long seed;                    /* shuffle seed (if shuffled) */
+    const char *const *meta;                    /* "key=value" tags (--meta) */
+    int         nmeta;
 };
 
 /*
- * done is the number of result entries completed (fewer than
- * nprobes * count if the session failed part way).
+ * results always holds nprobes * count entries; entries that never ran (the
+ * session failed part way) have fwd and rev of -1.  done is how many ran.
  */
 
 /* Human-readable report to stdout and, if outfile is non-NULL, to outfile. */

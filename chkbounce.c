@@ -2,6 +2,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <getopt.h>
+#include <ctype.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/random.h>
 #include <sys/socket.h>
 
 #include "protocol.h"
@@ -16,16 +20,15 @@ static const char default_tcp_str[] = "22,80,443,8080,8443";
 static const char default_udp_str[] = "53,123,161";
 static const char default_icmp_str[] = "0-255";
 
-#ifndef CHKBOUNCE_VERSION
-#define CHKBOUNCE_VERSION "unknown"
-#endif
+#include "version.h"
 
 static void usage(const char *prog) {
     fprintf(stderr,
         "Usage:\n"
         "  %s -s [-4|-6] [-p PORT] [--timeout=SECS]\n"
         "  %s -c SERVER [-4|-6] [-p PORT] [-i[TYPES]] [-t[PORTS]] [-u[PORTS]] [-r|-b] [-n N] [-q]\n"
-        "             [--timeout=SECS] [-o FILE] [--csv=FILE] [--json=FILE]\n"
+        "             [--shuffle[=SEED]] [--meta KEY=VALUE]... [--timeout=SECS]\n"
+        "             [-o FILE] [--csv=FILE] [--json=FILE]\n"
         "\n"
         "  SERVER may be a hostname or a numeric IPv4/IPv6 address.\n"
         "  In IPv6 sessions, -i TYPES are ICMPv6 type numbers.\n"
@@ -49,6 +52,10 @@ static void usage(const char *prog) {
         "  -b,        --both          Test each probe in both directions\n"
         "  -n N,      --count=N       Sweep the probe list N times (1-%d, default 1)\n"
         "  -q,        --quote         Send ICMP error types quoting a primer datagram\n"
+        "             --shuffle[=SEED]  Randomize probe order each round (seed is recorded;\n"
+        "                             give the same SEED to reproduce an order)\n"
+        "  -m KEY=VALUE, --meta=KEY=VALUE  Record a tag with the results (repeatable;\n"
+        "                             KEY is letters, digits, '_', '.', '-')\n"
         "  -o FILE,   --output=FILE   Write report to FILE in addition to stdout\n"
         "             --csv=FILE      Append results to FILE as CSV (header added if new)\n"
         "             --json=FILE     Write results to FILE as JSON\n"
@@ -56,6 +63,28 @@ static void usage(const char *prog) {
         prog, prog,
         DEFAULT_CONTROL_PORT, DEFAULT_TIMEOUT,
         default_tcp_str, default_udp_str, MAX_ATTEMPTS);
+}
+
+#define MAX_META     32
+#define MAX_META_KEY 63
+
+/* KEY=VALUE with a short identifier-like KEY and a printable VALUE */
+static int valid_meta(const char *s) {
+    const char *eq = strchr(s, '=');
+    if (!eq || eq == s || eq - s > MAX_META_KEY) return 0;
+    for (const char *p = s; p < eq; p++)
+        if (!isalnum((unsigned char)*p) && *p != '_' && *p != '.' && *p != '-')
+            return 0;
+    for (const char *p = eq + 1; *p; p++)
+        if (!isprint((unsigned char)*p)) return 0;
+    return 1;
+}
+
+/* Seed for --shuffle without a value: kernel randomness, else time and pid */
+static unsigned long long random_seed(void) {
+    unsigned long long v;
+    if (getrandom(&v, sizeof(v), 0) == (ssize_t)sizeof(v)) return v;
+    return (unsigned long long)time(NULL) ^ ((unsigned long long)getpid() << 32);
 }
 
 /*
@@ -122,6 +151,10 @@ int main(int argc, char **argv) {
     int   family       = AF_UNSPEC;
     int   count        = 1;
     int   quote        = 0;
+    int   do_shuffle   = 0;
+    unsigned long long seed = 0;
+    const char *meta[MAX_META];
+    int   nmeta        = 0;
     const char *icmp_str = NULL;
     const char *tcp_str  = NULL;
     const char *udp_str  = NULL;
@@ -144,12 +177,14 @@ int main(int argc, char **argv) {
         { "version", no_argument,       NULL, 'V' },
         { "count",   required_argument, NULL, 'n' },
         { "quote",   no_argument,       NULL, 'q' },
+        { "shuffle", optional_argument, NULL, 'S' },
+        { "meta",    required_argument, NULL, 'm' },
         { NULL, 0, NULL, 0 }
     };
 
     int opt, lidx;
     /* Note: optional_argument for short opts requires no space (-t80, not -t 80) */
-    while ((opt = getopt_long(argc, argv, "scp:T:i::t::u::o:rb46Vn:q", long_opts, &lidx)) != -1) {
+    while ((opt = getopt_long(argc, argv, "scp:T:i::t::u::o:rb46Vn:qm:", long_opts, &lidx)) != -1) {
         switch (opt) {
         case 's': mode = MODE_SERVER; break;
         case 'c': mode = MODE_CLIENT; break;
@@ -167,6 +202,32 @@ int main(int argc, char **argv) {
         case 'J': json_file = optarg; break;
         case 'n': count = atoi(optarg); break;
         case 'q': quote = 1;            break;
+        case 'S':
+            do_shuffle = 1;
+            if (optarg) {
+                char *end;
+                seed = strtoull(optarg, &end, 10);
+                if (!*optarg || *end) {
+                    fprintf(stderr, "Invalid shuffle seed: %s\n", optarg);
+                    return 1;
+                }
+            } else {
+                seed = random_seed();
+            }
+            break;
+        case 'm':
+            if (nmeta == MAX_META) {
+                fprintf(stderr, "Too many --meta tags (max %d)\n", MAX_META);
+                return 1;
+            }
+            if (!valid_meta(optarg)) {
+                fprintf(stderr, "Invalid --meta '%s': use KEY=VALUE, KEY of 1-%d letters, "
+                                "digits, '_', '.', '-', VALUE printable\n",
+                        optarg, MAX_META_KEY);
+                return 1;
+            }
+            meta[nmeta++] = optarg;
+            break;
         case 'V': printf("chkbounce %s\n", CHKBOUNCE_VERSION); return 0;
         default:
             usage(argv[0]);
@@ -236,6 +297,10 @@ int main(int argc, char **argv) {
         .udp_ports    = udp_ports,  .udp_count  = udp_count,
         .count        = count,
         .quote        = quote,
+        .shuffle      = do_shuffle,
+        .seed         = seed,
+        .meta         = meta,
+        .nmeta        = nmeta,
         .output_file  = output_file,
         .csv_file     = csv_file,
         .json_file    = json_file,

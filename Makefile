@@ -1,8 +1,7 @@
 PROGS   = chkbounce
 OBJS    = global.o packets.o receive.o report.o server.o client.o
 HEADERS = global.h protocol.h packets.h receive.h report.h server.h client.h
-VERSION := $(shell git describe --always --dirty 2>/dev/null || echo unknown)
-CFLAGS  = -Wall -Wextra -O2 -DCHKBOUNCE_VERSION='"$(VERSION)"'
+CFLAGS  = -Wall -Wextra -O2
 
 PREFIX  = /usr
 SBINDIR = $(PREFIX)/sbin
@@ -18,6 +17,20 @@ SETCAP ?= setcap
 
 all: $(PROGS)
 
+# version.h holds `git describe` and is rewritten only when that changes, so
+# every commit (or new uncommitted edit) rebuilds what records the version
+# and the label in -V, CSV and JSON is never stale.  If git can't answer
+# (no repo, or `sudo make install`, where git refuses a repo owned by another
+# user) an existing version.h is kept, so install doesn't relabel the build
+# "unknown" and recompile it as root.  Build with plain `make` first.
+version.h: FORCE
+	@v=$$(git describe --always --dirty 2>/dev/null); \
+	if [ -z "$$v" ] && [ -f $@ ]; then exit 0; fi; \
+	new="#define CHKBOUNCE_VERSION \"$${v:-unknown}\""; \
+	if [ ! -f $@ ] || [ "$$(cat $@)" != "$$new" ]; then \
+		echo "$$new" > $@; echo "version.h: $${v:-unknown}"; \
+	fi
+
 global.o: global.c global.h protocol.h
 	gcc $(CFLAGS) -c global.c
 
@@ -27,7 +40,7 @@ packets.o: packets.c packets.h global.h protocol.h
 receive.o: receive.c receive.h global.h protocol.h
 	gcc $(CFLAGS) -c receive.c
 
-report.o: report.c report.h global.h protocol.h client.h
+report.o: report.c report.h global.h protocol.h client.h version.h
 	gcc $(CFLAGS) -c report.c
 
 server.o: server.c server.h global.h protocol.h packets.h receive.h
@@ -36,7 +49,7 @@ server.o: server.c server.h global.h protocol.h packets.h receive.h
 client.o: client.c client.h global.h protocol.h packets.h receive.h report.h
 	gcc $(CFLAGS) -c client.c
 
-chkbounce: chkbounce.c $(OBJS) $(HEADERS)
+chkbounce: chkbounce.c $(OBJS) $(HEADERS) version.h
 	gcc $(CFLAGS) chkbounce.c -o chkbounce $(OBJS)
 
 install: $(PROGS)
@@ -65,6 +78,8 @@ uninstall:
 	rm -f $(DESTDIR)$(MAN8DIR)/chkbounce.8.gz
 
 clean:
-	rm -f $(PROGS) $(OBJS)
+	rm -f $(PROGS) $(OBJS) version.h
 
-.PHONY: all install uninstall clean
+FORCE:
+
+.PHONY: all install uninstall clean FORCE

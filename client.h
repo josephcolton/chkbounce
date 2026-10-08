@@ -19,6 +19,10 @@ struct client_opts {
     int   count;               /* attempts per probe (-n), 1..MAX_ATTEMPTS; the
                                   whole probe list is swept count times */
     int   quote;               /* -q: send ICMP error types quoting a primer */
+    int   shuffle;             /* --shuffle: randomize probe order each round */
+    unsigned long long seed;   /* shuffle seed (recorded in the output) */
+    const char *const *meta;   /* --meta "key=value" tags, recorded verbatim */
+    int   nmeta;
     const char *output_file;   /* text report copy (may be NULL) */
     const char *csv_file;      /* CSV rows appended here (may be NULL) */
     const char *json_file;     /* JSON document written here (may be NULL) */

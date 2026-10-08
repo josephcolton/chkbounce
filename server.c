@@ -32,7 +32,7 @@ static void serve_forward(struct session *s, const struct probe_next_payload *pn
     int number  = ntohs(pnp->number);
     int quoted  = proto == PROTO_ICMP && (pnp->flags & PROBE_FLAG_QUOTE);
     uint16_t tag = probe_tag(number, pnp->attempt, 0);
-    int received = 0;
+    int received = RESULT_UNAVAILABLE;   /* until a receiving socket is up */
 
     if (quoted) {
         /*
@@ -49,11 +49,11 @@ static void serve_forward(struct session *s, const struct probe_next_payload *pn
         struct port_payload go = { htons((uint16_t)(pfd >= 0 ? pr_port : 0)) };
         send_msg(s->ctrl_fd, MSG_PROBE_GO, &go, sizeof(go));
 
-        if (pfd >= 0) {
+        if (pfd >= 0 && s->icmp_fd >= 0)
             received = wait_icmp_quoted(s->icmp_fd, s->peer, number, pr_port,
                                         2 * s->timeout_sec);
+        if (pfd >= 0)
             close(pfd);
-        }
     } else {
         /* Open the probe socket for this one probe */
         int probe_fd = open_probe_socket(s->family, proto, number, s->icmp_fd);
@@ -63,7 +63,8 @@ static void serve_forward(struct session *s, const struct probe_next_payload *pn
         send_msg(s->ctrl_fd, MSG_PROBE_GO, &go, sizeof(go));
 
         /* Wait: returns as soon as the probe arrives or timeout expires */
-        received = wait_probe(proto, probe_fd, number, s->peer, s->timeout_sec, tag);
+        if (probe_fd >= 0)
+            received = wait_probe(proto, probe_fd, number, s->peer, s->timeout_sec, tag);
 
         /* Close per-probe socket; ICMP fd is kept open for the session */
         close_probe_socket(proto, probe_fd);
@@ -101,10 +102,11 @@ static void serve_reverse(struct session *s, const struct probe_next_payload *pn
 
         printf("Sending %s %d (quoted, %s) to %s\n", proto_name(proto, s->family),
                number, sent.primed ? "primed" : "primer not received", s->client_ip);
-        send_icmp_quoted(s->peer, s->local, number, &inner_src, &inner_dst, tag);
+        sent.sent = send_icmp_quoted(s->peer, s->local, number,
+                                     &inner_src, &inner_dst, tag) >= 0;
     } else {
         printf("Sending %s %d to %s\n", proto_name(proto, s->family), number, s->client_ip);
-        send_probe(s->peer, s->local, proto, number, s->timeout_sec, tag);
+        sent.sent = send_probe(s->peer, s->local, proto, number, s->timeout_sec, tag) >= 0;
     }
     send_msg(s->ctrl_fd, MSG_RPROBE_SENT, &sent, sizeof(sent));
 }
@@ -150,7 +152,10 @@ static void handle_client(int ctrl_fd, const struct sockaddr_storage *peer,
     s.quote_fd = open_udp_local(local, &s.quote_port);
 
     /* Signal ready; per-probe sockets will be opened on demand */
-    struct port_payload ready = { htons((uint16_t)(s.quote_fd >= 0 ? s.quote_port : 0)) };
+    struct ready_payload ready;
+    memset(&ready, 0, sizeof(ready));
+    ready.port = htons((uint16_t)(s.quote_fd >= 0 ? s.quote_port : 0));
+    snprintf(ready.observed_addr, sizeof(ready.observed_addr), "%s", s.client_ip);
     send_msg(ctrl_fd, MSG_READY, &ready, sizeof(ready));
 
     while (1) {

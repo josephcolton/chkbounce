@@ -7,10 +7,7 @@
 #include "protocol.h"
 #include "client.h"
 #include "report.h"
-
-#ifndef CHKBOUNCE_VERSION
-#define CHKBOUNCE_VERSION "unknown"
-#endif
+#include "version.h"
 
 /* Stable lowercase protocol names for machine-readable output */
 static const char *proto_key(int proto) {
@@ -22,34 +19,72 @@ static const char *proto_key(int proto) {
     return "unknown";
 }
 
+/* Stable outcome names for machine-readable output */
+static const char *result_key(int r) {
+    switch (r) {
+    case RESULT_RECEIVED:    return "received";
+    case RESULT_LOST:        return "not_received";
+    case RESULT_UNAVAILABLE: return "unavailable";
+    }
+    return "not_tested";
+}
+
+/* The client is behind NAT if the server saw a different address */
+static int behind_nat(const struct run_info *info) {
+    return info->client_observed_addr[0] &&
+           strcmp(info->client_addr, info->client_observed_addr) != 0;
+}
+
 /* ------------------------------------------------------------------ aggregation */
 
-/* All completed attempts of one probe, per direction */
-struct agg {
-    int fwd, fwd_n;   /* received / tested, client -> server */
-    int rev, rev_n;   /* received / tested, server -> client */
+/* All attempts of one probe in one direction */
+struct dir_agg {
+    int received;      /* attempts that arrived */
+    int tested;        /* attempts that ran and were available */
+    int unavailable;   /* attempts that couldn't be set up */
 };
 
-/* Aggregate probe i (0 <= i < nprobes) over the first done entries. */
+struct agg {
+    struct dir_agg fwd, rev;
+};
+
+static void add(struct dir_agg *d, int r) {
+    if (r == RESULT_UNAVAILABLE) { d->unavailable++; return; }
+    if (r < 0) return;
+    d->tested++;
+    if (r == RESULT_RECEIVED) d->received++;
+}
+
+static void add_dir(struct dir_agg *t, const struct dir_agg *d) {
+    t->received    += d->received;
+    t->tested      += d->tested;
+    t->unavailable += d->unavailable;
+}
+
+static int nres(const struct run_info *info) {
+    return info->nprobes * info->count;
+}
+
+/* Aggregate probe i (0 <= i < nprobes) over every round. */
 static struct agg aggregate(const struct run_info *info, const struct result *results,
-                            int done, int i) {
-    struct agg a = { 0, 0, 0, 0 };
-    for (int j = i; j < done; j += info->nprobes) {
-        const struct result *r = &results[j];
-        if (r->fwd >= 0) { a.fwd_n++; a.fwd += r->fwd; }
-        if (r->rev >= 0) { a.rev_n++; a.rev += r->rev; }
+                            int i) {
+    struct agg a;
+    memset(&a, 0, sizeof(a));
+    for (int j = i; j < nres(info); j += info->nprobes) {
+        add(&a.fwd, results[j].fwd);
+        add(&a.rev, results[j].rev);
     }
     return a;
 }
 
-/* Received in one direction only (any attempt), i.e. not explained by loss. */
-static int asymmetric(const struct agg *a) {
-    return a->fwd_n > 0 && a->rev_n > 0 && (a->fwd > 0) != (a->rev > 0);
+static int ran(const struct dir_agg *d) {
+    return d->tested + d->unavailable > 0;
 }
 
-/* Probes that appear in the first done entries (all of them after round 1) */
-static int probes_seen(const struct run_info *info, int done) {
-    return done < info->nprobes ? done : info->nprobes;
+/* Received in one direction only (any attempt), i.e. not explained by loss. */
+static int asymmetric(const struct agg *a) {
+    return a->fwd.tested > 0 && a->rev.tested > 0 &&
+           (a->fwd.received > 0) != (a->rev.received > 0);
 }
 
 /* ------------------------------------------------------------------ text report */
@@ -67,47 +102,53 @@ static void rprintf(FILE *outfile, const char *fmt, ...) {
     }
 }
 
-/* "RECEIVED" / "not received" for single attempts, "k/n" for repeats */
-static const char *status(int received, int tested, char *buf, size_t len) {
-    if (tested == 0) return "-";
-    if (tested == 1) return received ? "RECEIVED" : "not received";
-    snprintf(buf, len, "%d/%d", received, tested);
+/*
+ * "RECEIVED" / "not received" / "unavailable" for single attempts; "k/n"
+ * over available attempts for repeats, plus "+u unavail" if some couldn't
+ * be set up.
+ */
+static const char *status(const struct dir_agg *d, int count, char *buf, size_t len) {
+    if (!ran(d)) return "-";
+    if (d->tested == 0) return "unavailable";
+    if (count == 1) return d->received ? "RECEIVED" : "not received";
+    if (d->unavailable)
+        snprintf(buf, len, "%d/%d +%d unavail", d->received, d->tested, d->unavailable);
+    else
+        snprintf(buf, len, "%d/%d", d->received, d->tested);
     return buf;
 }
 
-static void print_section(const struct result *results, int done, int proto,
+static void print_section(const struct result *results, int proto,
                           const struct run_info *info, FILE *outfile) {
-    int nseen = probes_seen(info, done);
     int any = 0;
-    for (int i = 0; i < nseen; i++) if (results[i].proto == proto) { any = 1; break; }
+    for (int i = 0; i < info->nprobes; i++) if (results[i].proto == proto) { any = 1; break; }
     if (!any) return;
 
     const char *label = proto == PROTO_ICMP ? "Type" : "Port";
     int width = proto == PROTO_ICMP ? 3 : 5;
     int directions = info->directions;
-    char b1[16], b2[16];
+    char b1[48], b2[48];   /* "%d/%d +%d unavail" with any int values */
 
     rprintf(outfile, "\n%s Probes:\n", proto_name(proto, info->family));
     if (directions == DIR_BOTH)
-        rprintf(outfile, "  %*s  %-14s %-14s\n", (int)strlen(label) + width + 2, "",
+        rprintf(outfile, "  %*s  %-16s %-16s\n", (int)strlen(label) + width + 2, "",
                 "client->server", "server->client");
 
-    for (int i = 0; i < nseen; i++) {
+    for (int i = 0; i < info->nprobes; i++) {
         const struct result *r = &results[i];
         if (r->proto != proto) continue;
-        struct agg a = aggregate(info, results, done, i);
+        struct agg a = aggregate(info, results, i);
+        if (!ran(&a.fwd) && !ran(&a.rev)) continue;     /* never reached */
         const char *q = r->quoted ? " [quoted]" : "";
         if (directions == DIR_BOTH)
-            rprintf(outfile, "  %s %*d:  %-14s %-14s%s%s\n", label, width, r->number,
-                    status(a.fwd, a.fwd_n, b1, sizeof(b1)),
-                    status(a.rev, a.rev_n, b2, sizeof(b2)),
+            rprintf(outfile, "  %s %*d:  %-16s %-16s%s%s\n", label, width, r->number,
+                    status(&a.fwd, info->count, b1, sizeof(b1)),
+                    status(&a.rev, info->count, b2, sizeof(b2)),
                     asymmetric(&a) ? " ASYMMETRIC" : "", q);
-        else if (directions == DIR_FORWARD)
-            rprintf(outfile, "  %s %*d: %s%s\n", label, width, r->number,
-                    status(a.fwd, a.fwd_n, b1, sizeof(b1)), q);
         else
             rprintf(outfile, "  %s %*d: %s%s\n", label, width, r->number,
-                    status(a.rev, a.rev_n, b1, sizeof(b1)), q);
+                    status(directions == DIR_FORWARD ? &a.fwd : &a.rev,
+                           info->count, b1, sizeof(b1)), q);
     }
 }
 
@@ -118,6 +159,8 @@ void print_report(const struct run_info *info, const struct result *results,
     rprintf(outfile, "\n=== chkbounce Report ===\n");
     rprintf(outfile, "Client: %s  Server: %s  (%s)\n",
             info->client_addr, info->server_addr, family_name(info->family));
+    if (behind_nat(info))
+        rprintf(outfile, "Client is behind NAT: server saw %s\n", info->client_observed_addr);
     if (directions == DIR_FORWARD)
         rprintf(outfile, "Direction: client -> server");
     else if (directions == DIR_REVERSE)
@@ -126,63 +169,93 @@ void print_report(const struct run_info *info, const struct result *results,
         rprintf(outfile, "Direction: both");
     if (info->count > 1)
         rprintf(outfile, "  Attempts per probe: %d", info->count);
+    if (info->shuffled)
+        rprintf(outfile, "  Shuffle seed: %llu", info->seed);
     rprintf(outfile, "\n");
+    for (int m = 0; m < info->nmeta; m++)
+        rprintf(outfile, "Meta: %s\n", info->meta[m]);
     if (info->quote)
         rprintf(outfile, "ICMP error types marked [quoted] were sent quoting a primer datagram\n");
 
-    print_section(results, done, PROTO_ICMP, info, outfile);
-    print_section(results, done, PROTO_TCP,  info, outfile);
-    print_section(results, done, PROTO_UDP,  info, outfile);
+    print_section(results, PROTO_ICMP, info, outfile);
+    print_section(results, PROTO_TCP,  info, outfile);
+    print_section(results, PROTO_UDP,  info, outfile);
 
-    struct agg tot = { 0, 0, 0, 0 };
+    struct agg tot;
+    memset(&tot, 0, sizeof(tot));
     int asym = 0;
-    for (int i = 0; i < probes_seen(info, done); i++) {
-        struct agg a = aggregate(info, results, done, i);
-        tot.fwd += a.fwd; tot.fwd_n += a.fwd_n;
-        tot.rev += a.rev; tot.rev_n += a.rev_n;
+    for (int i = 0; i < info->nprobes; i++) {
+        struct agg a = aggregate(info, results, i);
+        add_dir(&tot.fwd, &a.fwd);
+        add_dir(&tot.rev, &a.rev);
         asym += asymmetric(&a);
     }
 
     rprintf(outfile, "\nSummary:");
     if (directions & DIR_FORWARD)
-        rprintf(outfile, " client->server %d of %d received", tot.fwd, tot.fwd_n);
+        rprintf(outfile, " client->server %d of %d received", tot.fwd.received, tot.fwd.tested);
     if (directions == DIR_BOTH)
         rprintf(outfile, ";");
     if (directions & DIR_REVERSE)
-        rprintf(outfile, " server->client %d of %d received", tot.rev, tot.rev_n);
+        rprintf(outfile, " server->client %d of %d received", tot.rev.received, tot.rev.tested);
     if (directions == DIR_BOTH)
         rprintf(outfile, "; %d asymmetric", asym);
     rprintf(outfile, "\n");
-    if (done < info->nprobes * info->count)
-        rprintf(outfile, "Incomplete: %d of %d probe attempts ran\n",
-                done, info->nprobes * info->count);
+    if (tot.fwd.unavailable + tot.rev.unavailable)
+        rprintf(outfile, "Unavailable (not counted above): %d attempts could not be set up\n",
+                tot.fwd.unavailable + tot.rev.unavailable);
+    if (done < nres(info))
+        rprintf(outfile, "Incomplete: %d of %d probe attempts ran\n", done, nres(info));
 }
 
 /* -------------------------------------------------------------------------- CSV */
 
+/* All --meta tags as one RFC 4180 quoted field: "key=value;key=value" */
+static void csv_meta(FILE *f, const struct run_info *info) {
+    fputc('"', f);
+    for (int m = 0; m < info->nmeta; m++) {
+        if (m) fputc(';', f);
+        for (const char *p = info->meta[m]; *p; p++) {
+            if (*p == '"') fputc('"', f);      /* embedded quotes are doubled */
+            fputc(*p, f);
+        }
+    }
+    fputc('"', f);
+}
+
 /* Hostnames and numeric addresses never contain commas or quotes, so no quoting */
 static void csv_row(FILE *f, const struct run_info *info, const struct result *r,
-                    const char *direction, int received, int primed, const char *time) {
+                    const char *direction, int outcome, int primed, const char *time) {
+    char seed[24] = "";
+    if (info->shuffled) snprintf(seed, sizeof(seed), "%llu", info->seed);
+    const char *received = outcome == RESULT_RECEIVED ? "1"
+                         : outcome == RESULT_LOST     ? "0" : "";
     const char *primed_s = primed < 0 ? "" : primed ? "1" : "0";
-    fprintf(f, "%s,%s,%s,%s,%s,%s,%d,%s,%d,%d,%d,%s,%d,%s,%s\n",
+
+    fprintf(f, "%s,%s,%s,%s,%s,%s,%s,%d,%d,%s,%s,%d,%d,%d,%d,%s,%s,%s,%s,%s,",
             info->start, CHKBOUNCE_VERSION, family_name(info->family),
             info->server_host, info->server_addr, info->client_addr,
-            info->timeout_sec, proto_key(r->proto), r->number, r->quoted,
-            r->attempt + 1, direction, received, primed_s, time);
+            info->client_observed_addr, behind_nat(info), info->timeout_sec, seed,
+            proto_key(r->proto), r->number, r->quoted, r->attempt + 1, r->order,
+            direction, result_key(outcome), received, primed_s, time);
+    csv_meta(f, info);
+    fputc('\n', f);
 }
 
 int write_csv(const char *path, const struct run_info *info,
               const struct result *results, int done) {
+    (void)done;   /* entries that never ran are skipped by their -1 outcome */
     FILE *f = fopen(path, "a");
     if (!f) { perror(path); return -1; }
 
     fseek(f, 0, SEEK_END);
     if (ftell(f) == 0)
         fprintf(f, "run_start,version,family,server_host,server_addr,client_addr,"
-                   "timeout_sec,proto,number,quoted,attempt,direction,received,"
-                   "primed,probe_time\n");
+                   "client_observed_addr,nat,timeout_sec,shuffle_seed,proto,number,"
+                   "quoted,attempt,order,direction,status,received,primed,"
+                   "probe_time,meta\n");
 
-    for (int i = 0; i < done; i++) {
+    for (int i = 0; i < nres(info); i++) {
         const struct result *r = &results[i];
         if (r->fwd >= 0)
             csv_row(f, info, r, "client_to_server", r->fwd, r->fwd_primed, r->fwd_time);
@@ -205,23 +278,23 @@ static void json_str(FILE *f, const char *s) {
     fputc('"', f);
 }
 
-/* {"received": k, "attempts": n, "tries": [...]} for one direction, or null */
+/* {"received": k, "attempts": n, "unavailable": u, "tries": [...]}, or null */
 static void json_dir(FILE *f, const struct run_info *info, const struct result *results,
-                     int done, int i, int reverse) {
-    struct agg a = aggregate(info, results, done, i);
-    int received = reverse ? a.rev : a.fwd;
-    int tested   = reverse ? a.rev_n : a.fwd_n;
-    if (tested == 0) { fputs("null", f); return; }
+                     int i, int reverse) {
+    struct agg a = aggregate(info, results, i);
+    const struct dir_agg *d = reverse ? &a.rev : &a.fwd;
+    if (!ran(d)) { fputs("null", f); return; }
 
-    fprintf(f, "{\"received\": %d, \"attempts\": %d, \"tries\": [", received, tested);
+    fprintf(f, "{\"received\": %d, \"attempts\": %d, \"unavailable\": %d, \"tries\": [",
+            d->received, d->tested, d->unavailable);
     int first = 1;
-    for (int j = i; j < done; j += info->nprobes) {
+    for (int j = i; j < nres(info); j += info->nprobes) {
         const struct result *r = &results[j];
-        int rec    = reverse ? r->rev : r->fwd;
-        int primed = reverse ? r->rev_primed : r->fwd_primed;
-        if (rec < 0) continue;
-        fprintf(f, "%s{\"received\": %s, \"time\": ", first ? "" : ", ",
-                rec ? "true" : "false");
+        int outcome = reverse ? r->rev : r->fwd;
+        int primed  = reverse ? r->rev_primed : r->fwd_primed;
+        if (outcome < 0) continue;
+        fprintf(f, "%s{\"status\": \"%s\", \"order\": %d, \"time\": ",
+                first ? "" : ", ", result_key(outcome), r->order);
         json_str(f, reverse ? r->rev_time : r->fwd_time);
         if (primed >= 0)
             fprintf(f, ", \"primed\": %s", primed ? "true" : "false");
@@ -229,6 +302,11 @@ static void json_dir(FILE *f, const struct run_info *info, const struct result *
         first = 0;
     }
     fputs("]}", f);
+}
+
+static void json_dir_total(FILE *f, const char *name, const struct dir_agg *d) {
+    fprintf(f, "\"%s\": {\"received\": %d, \"tested\": %d, \"unavailable\": %d}, ",
+            name, d->received, d->tested, d->unavailable);
 }
 
 int write_json(const char *path, const struct run_info *info,
@@ -244,46 +322,62 @@ int write_json(const char *path, const struct run_info *info,
     fputs(",\n  \"server_host\": ", f);    json_str(f, info->server_host);
     fputs(",\n  \"server_addr\": ", f);    json_str(f, info->server_addr);
     fputs(",\n  \"client_addr\": ", f);    json_str(f, info->client_addr);
+    fputs(",\n  \"client_observed_addr\": ", f); json_str(f, info->client_observed_addr);
+    fprintf(f, ",\n  \"nat\": %s", behind_nat(info) ? "true" : "false");
     fprintf(f, ",\n  \"control_port\": %d,\n  \"timeout_sec\": %d,\n",
             info->control_port, info->timeout_sec);
     fprintf(f, "  \"count\": %d,\n  \"quote\": %s,\n", info->count,
             info->quote ? "true" : "false");
-    fprintf(f, "  \"complete\": %s,\n",
-            done == info->nprobes * info->count ? "true" : "false");
+    /* The seed is a string: 64-bit values don't survive JSON number parsing */
+    if (info->shuffled)
+        fprintf(f, "  \"shuffle_seed\": \"%llu\",\n", info->seed);
+    else
+        fputs("  \"shuffle_seed\": null,\n", f);
+    fprintf(f, "  \"complete\": %s,\n", done == nres(info) ? "true" : "false");
     fprintf(f, "  \"directions\": [%s%s%s],\n",
             (info->directions & DIR_FORWARD) ? "\"client_to_server\"" : "",
             info->directions == DIR_BOTH ? ", " : "",
             (info->directions & DIR_REVERSE) ? "\"server_to_client\"" : "");
 
-    struct agg tot = { 0, 0, 0, 0 };
-    int asym = 0, nseen = probes_seen(info, done);
+    /* --meta tags were validated as key=value with a short key in main */
+    fputs("  \"meta\": {", f);
+    for (int m = 0; m < info->nmeta; m++) {
+        const char *eq = strchr(info->meta[m], '=');
+        fprintf(f, "%s\"%.*s\": ", m ? ", " : "", (int)(eq - info->meta[m]), info->meta[m]);
+        json_str(f, eq + 1);
+    }
+    fputs("},\n", f);
+
+    struct agg tot;
+    memset(&tot, 0, sizeof(tot));
+    int asym = 0, first = 1;
 
     fputs("  \"results\": [", f);
-    for (int i = 0; i < nseen; i++) {
+    for (int i = 0; i < info->nprobes; i++) {
         const struct result *r = &results[i];
-        struct agg a = aggregate(info, results, done, i);
-        tot.fwd += a.fwd; tot.fwd_n += a.fwd_n;
-        tot.rev += a.rev; tot.rev_n += a.rev_n;
+        struct agg a = aggregate(info, results, i);
+        if (!ran(&a.fwd) && !ran(&a.rev)) continue;
+        add_dir(&tot.fwd, &a.fwd);
+        add_dir(&tot.rev, &a.rev);
         asym += asymmetric(&a);
 
         fprintf(f, "%s\n    {\"proto\": \"%s\", \"number\": %d, \"quoted\": %s, "
                    "\"client_to_server\": ",
-                i ? "," : "", proto_key(r->proto), r->number,
+                first ? "" : ",", proto_key(r->proto), r->number,
                 r->quoted ? "true" : "false");
-        json_dir(f, info, results, done, i, 0);
+        json_dir(f, info, results, i, 0);
         fputs(", \"server_to_client\": ", f);
-        json_dir(f, info, results, done, i, 1);
+        json_dir(f, info, results, i, 1);
         fprintf(f, ", \"asymmetric\": %s}", asymmetric(&a) ? "true" : "false");
+        first = 0;
     }
-    fputs(nseen ? "\n  ],\n" : "],\n", f);
+    fputs(first ? "],\n" : "\n  ],\n", f);
 
     fputs("  \"summary\": {", f);
     if (info->directions & DIR_FORWARD)
-        fprintf(f, "\"client_to_server\": {\"received\": %d, \"tested\": %d}, ",
-                tot.fwd, tot.fwd_n);
+        json_dir_total(f, "client_to_server", &tot.fwd);
     if (info->directions & DIR_REVERSE)
-        fprintf(f, "\"server_to_client\": {\"received\": %d, \"tested\": %d}, ",
-                tot.rev, tot.rev_n);
+        json_dir_total(f, "server_to_client", &tot.rev);
     fprintf(f, "\"asymmetric\": %d}\n}\n", asym);
 
     return fclose(f) == 0 ? 0 : -1;
