@@ -9,6 +9,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 
 #include "global.h"
 #include "protocol.h"
@@ -70,13 +71,29 @@ int read_all(int fd, void *buf, size_t n) {
 }
 
 int send_msg(int fd, uint8_t type, const void *payload, uint32_t len) {
+    /* One write per message: header and payload in separate small writes
+       stall on Nagle + delayed ACK (~40 ms per message) */
+    if (!payload) len = 0;
+    size_t total = sizeof(struct msg_hdr) + len;
+    char   stackbuf[256];
+    char  *buf = total <= sizeof(stackbuf) ? stackbuf : malloc(total);
+    if (!buf) return -1;
+
     struct msg_hdr hdr;
     hdr.type = type;
     hdr.len  = htonl(len);
-    if (write_all(fd, &hdr, sizeof(hdr)) < 0) return -1;
-    if (len > 0 && payload)
-        if (write_all(fd, payload, len) < 0) return -1;
-    return 0;
+    memcpy(buf, &hdr, sizeof(hdr));
+    if (len > 0)
+        memcpy(buf + sizeof(hdr), payload, len);
+
+    int r = write_all(fd, buf, total);
+    if (buf != stackbuf) free(buf);
+    return r;
+}
+
+void set_nodelay(int fd) {
+    int on = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
 }
 
 int resolve_host(const char *host, int family, struct sockaddr_storage *out) {
@@ -100,6 +117,12 @@ int resolve_host(const char *host, int family, struct sockaddr_storage *out) {
 socklen_t sa_len(const struct sockaddr_storage *ss) {
     return ss->ss_family == AF_INET6 ? sizeof(struct sockaddr_in6)
                                      : sizeof(struct sockaddr_in);
+}
+
+int sa_get_port(const struct sockaddr_storage *ss) {
+    if (ss->ss_family == AF_INET6)
+        return ntohs(((const struct sockaddr_in6 *)ss)->sin6_port);
+    return ntohs(((const struct sockaddr_in *)ss)->sin_port);
 }
 
 void sa_set_port(struct sockaddr_storage *ss, int port) {
@@ -140,6 +163,22 @@ const char *sa_ntop(const struct sockaddr_storage *ss, char *buf, size_t len) {
     if (!inet_ntop(ss->ss_family, addr, buf, (socklen_t)len))
         snprintf(buf, len, "?");
     return buf;
+}
+
+int icmp_is_error(int family, int type) {
+    if (family == AF_INET6)
+        return type < 128;
+    switch (type) {
+    case 3:  /* Destination Unreachable */
+    case 4:  /* Source Quench (deprecated, RFC 6633) */
+    case 5:  /* Redirect */
+    case 11: /* Time Exceeded */
+    case 12: /* Parameter Problem */
+    case 31: /* Datagram Conversion Error (deprecated, RFC 6918) */
+    case 40: /* Photuris */
+        return 1;
+    }
+    return 0;
 }
 
 const char *family_name(int family) {

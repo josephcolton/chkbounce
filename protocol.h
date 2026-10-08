@@ -10,7 +10,7 @@
 
 /* Control-channel message types */
 #define MSG_NEGOTIATE    1   /* client->server: list of probes */
-#define MSG_READY        2   /* server->client: sockets set up */
+#define MSG_READY        2   /* server->client: session set up */
 #define MSG_PROBE_NEXT   3   /* client->server: about to send probe */
 #define MSG_PROBE_GO     4   /* server->client: ready for this probe */
 #define MSG_PROBE_RESULT 5   /* server->client: received or not */
@@ -18,19 +18,32 @@
 #define MSG_RPROBE_REQ   7   /* client->server: send me this probe (reverse) */
 #define MSG_RPROBE_SENT  8   /* server->client: reverse probe has been sent */
 
-/*
- * Probe packet contents.  UDP probes carry PROBE_MAGIC; ICMP probes carry
- * PROBE_ICMP_ID in the identifier field and a sequence number that encodes
- * the type and direction, so a receiver can tell its probe apart from the
- * kernel's automatic echo reply to an earlier probe (e.g. type 129 arriving
- * in answer to a type 128 probe).  Receivers check the sequence number only:
- * NATs rewrite the echo identifier.
- */
-#define PROBE_MAGIC   "chkbounce"
-#define PROBE_ICMP_ID 0xCB0C
+/* probe_next_payload.flags */
+#define PROBE_FLAG_QUOTE 0x01  /* ICMP error type: send with a quoted packet */
 
-static inline uint16_t probe_icmp_seq(int icmp_type, int reverse) {
-    return (uint16_t)((icmp_type << 1) | (reverse ? 1 : 0));
+/* Each probe may be repeated; attempt numbers are 0..MAX_ATTEMPTS-1 */
+#define MAX_ATTEMPTS 127
+
+/*
+ * Probe tags.  Every probe carries a 16-bit tag encoding its number (ICMP
+ * type, or port modulo 256), attempt, and direction, so a receiver never
+ * counts a stray packet: a late copy of an earlier attempt, or the kernel's
+ * automatic reply to an earlier probe (e.g. the Echo Reply, ICMPv6 129, that
+ * answers a type 128 probe).
+ *
+ *   ICMP probes:   identifier = PROBE_ICMP_ID, sequence = tag.  Receivers
+ *                  check the sequence only; NATs rewrite the identifier.
+ *   UDP probes and quote primers: payload = PROBE_MAGIC (no NUL) + tag.
+ *   Quoted ICMP error probes: matched by the quoted UDP ports instead (the
+ *                  4 bytes after the checksum are zero, as in a real error).
+ */
+#define PROBE_MAGIC     "chkbounce"
+#define PROBE_MAGIC_LEN (sizeof(PROBE_MAGIC) - 1)
+#define PROBE_ICMP_ID   0xCB0C
+
+static inline uint16_t probe_tag(int number, int attempt, int reverse) {
+    return (uint16_t)(((attempt & 0x7f) << 9) | ((number & 0xff) << 1) |
+                      (reverse ? 1 : 0));
 }
 
 #define DEFAULT_CONTROL_PORT 1234
@@ -46,22 +59,39 @@ static inline uint16_t probe_icmp_seq(int icmp_type, int reverse) {
  *   [4 bytes: count][count * probe_entry]
  *   probe_entry = [1 byte: proto][2 bytes: number]
  *
- * MSG_PROBE_NEXT payload:
- *   [1 byte: proto][2 bytes: number]
+ * MSG_READY payload: port_payload, the server's session UDP port that
+ *   receives quote primers (0 if unavailable).
  *
- * MSG_RPROBE_REQ payload: same layout as MSG_PROBE_NEXT.
+ * MSG_PROBE_NEXT / MSG_RPROBE_REQ payload: probe_next_payload.  port is the
+ *   client's UDP port for quoted probes: in PROBE_NEXT the port the primer
+ *   must be sent to; in RPROBE_REQ the port the client's primer came from.
  *
- * MSG_PROBE_RESULT payload:
- *   [1 byte: proto][2 bytes: number][1 byte: received (0 or 1)]
+ * MSG_PROBE_GO payload: port_payload, the server's primer source port for a
+ *   quoted forward probe (0 otherwise).
  *
- * MSG_READY, MSG_PROBE_GO, MSG_DONE, MSG_RPROBE_SENT: zero-length payload.
+ * MSG_PROBE_RESULT payload: probe_result_payload.
+ *
+ * MSG_RPROBE_SENT payload: rprobe_sent_payload.
+ *
+ * MSG_DONE: zero-length payload.
  *
  * Forward probe (client -> server):
  *   PROBE_NEXT -> PROBE_GO -> client sends probe -> PROBE_RESULT
  *
  * Reverse probe (server -> client), client already listening:
  *   RPROBE_REQ -> server sends probe -> RPROBE_SENT
- *   The client decides received/not itself; no result message is needed.
+ *   The client decides received/not itself.
+ *
+ * Quoted ICMP error probes.  The probe's receiver R first sends a UDP primer
+ * (PROBE_MAGIC + tag) from a fresh port to the error sender S, creating
+ * state in any stateful middlebox; S then sends the ICMP error quoting that
+ * primer as R's address/port -> S's address/port.  S uses the primer's
+ * observed source when it arrives (so NAT is handled) and the port R
+ * reported otherwise; "primed" records which.
+ *   Forward (S = client): client binds port Ps and sends PROBE_NEXT{port=Ps};
+ *     server primes from port Pr to client:Ps, replies PROBE_GO{port=Pr}.
+ *   Reverse (S = server): client primes from port Pr to the server's session
+ *     port (from MSG_READY), then sends RPROBE_REQ{port=Pr}.
  */
 
 #pragma pack(push, 1)
@@ -78,13 +108,24 @@ struct probe_entry {
 
 struct probe_next_payload {
     uint8_t  proto;
-    uint16_t number; /* network byte order */
+    uint16_t number;  /* network byte order */
+    uint8_t  attempt; /* 0-based repeat number */
+    uint8_t  flags;   /* PROBE_FLAG_* */
+    uint16_t port;    /* network byte order; see above */
+};
+
+struct port_payload {
+    uint16_t port;    /* network byte order */
 };
 
 struct probe_result_payload {
     uint8_t  proto;
     uint16_t number;   /* network byte order */
     uint8_t  received; /* 1 = received, 0 = not */
+};
+
+struct rprobe_sent_payload {
+    uint8_t  primed;   /* quoted probe: 1 if the client's primer arrived */
 };
 
 #pragma pack(pop)

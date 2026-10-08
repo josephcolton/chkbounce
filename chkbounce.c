@@ -24,7 +24,7 @@ static void usage(const char *prog) {
     fprintf(stderr,
         "Usage:\n"
         "  %s -s [-4|-6] [-p PORT] [--timeout=SECS]\n"
-        "  %s -c SERVER [-4|-6] [-p PORT] [-i[TYPES]] [-t[PORTS]] [-u[PORTS]] [-r|-b]\n"
+        "  %s -c SERVER [-4|-6] [-p PORT] [-i[TYPES]] [-t[PORTS]] [-u[PORTS]] [-r|-b] [-n N] [-q]\n"
         "             [--timeout=SECS] [-o FILE] [--csv=FILE] [--json=FILE]\n"
         "\n"
         "  SERVER may be a hostname or a numeric IPv4/IPv6 address.\n"
@@ -47,13 +47,15 @@ static void usage(const char *prog) {
         "  -u[PORTS], --udp[=PORTS]   UDP port probes  (default: %s)\n"
         "  -r,        --reverse       Server sends probes to client (server -> client)\n"
         "  -b,        --both          Test each probe in both directions\n"
+        "  -n N,      --count=N       Sweep the probe list N times (1-%d, default 1)\n"
+        "  -q,        --quote         Send ICMP error types quoting a primer datagram\n"
         "  -o FILE,   --output=FILE   Write report to FILE in addition to stdout\n"
         "             --csv=FILE      Append results to FILE as CSV (header added if new)\n"
         "             --json=FILE     Write results to FILE as JSON\n"
         "  -V,        --version       Print version and exit\n",
         prog, prog,
         DEFAULT_CONTROL_PORT, DEFAULT_TIMEOUT,
-        default_tcp_str, default_udp_str);
+        default_tcp_str, default_udp_str, MAX_ATTEMPTS);
 }
 
 /*
@@ -118,6 +120,8 @@ int main(int argc, char **argv) {
     char *json_file    = NULL;
     int   directions   = DIR_FORWARD;
     int   family       = AF_UNSPEC;
+    int   count        = 1;
+    int   quote        = 0;
     const char *icmp_str = NULL;
     const char *tcp_str  = NULL;
     const char *udp_str  = NULL;
@@ -138,12 +142,14 @@ int main(int argc, char **argv) {
         { "csv",     required_argument, NULL, 'C' },
         { "json",    required_argument, NULL, 'J' },
         { "version", no_argument,       NULL, 'V' },
+        { "count",   required_argument, NULL, 'n' },
+        { "quote",   no_argument,       NULL, 'q' },
         { NULL, 0, NULL, 0 }
     };
 
     int opt, lidx;
     /* Note: optional_argument for short opts requires no space (-t80, not -t 80) */
-    while ((opt = getopt_long(argc, argv, "scp:T:i::t::u::o:rb46V", long_opts, &lidx)) != -1) {
+    while ((opt = getopt_long(argc, argv, "scp:T:i::t::u::o:rb46Vn:q", long_opts, &lidx)) != -1) {
         switch (opt) {
         case 's': mode = MODE_SERVER; break;
         case 'c': mode = MODE_CLIENT; break;
@@ -159,6 +165,8 @@ int main(int argc, char **argv) {
         case '6': family = AF_INET6;        break;
         case 'C': csv_file  = optarg; break;
         case 'J': json_file = optarg; break;
+        case 'n': count = atoi(optarg); break;
+        case 'q': quote = 1;            break;
         case 'V': printf("chkbounce %s\n", CHKBOUNCE_VERSION); return 0;
         default:
             usage(argv[0]);
@@ -178,6 +186,10 @@ int main(int argc, char **argv) {
     }
     if (timeout_sec <= 0) {
         fprintf(stderr, "Invalid timeout: %d\n", timeout_sec);
+        return 1;
+    }
+    if (count < 1 || count > MAX_ATTEMPTS) {
+        fprintf(stderr, "Invalid count: %d (must be 1-%d)\n", count, MAX_ATTEMPTS);
         return 1;
     }
 
@@ -222,6 +234,8 @@ int main(int argc, char **argv) {
         .icmp_types   = icmp_types, .icmp_count = icmp_count,
         .tcp_ports    = tcp_ports,  .tcp_count  = tcp_count,
         .udp_ports    = udp_ports,  .udp_count  = udp_count,
+        .count        = count,
+        .quote        = quote,
         .output_file  = output_file,
         .csv_file     = csv_file,
         .json_file    = json_file,

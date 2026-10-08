@@ -22,6 +22,9 @@ chkbounce \- network packet reachability tester
 .RB [ \-t [ ports ]]
 .RB [ \-u [ ports ]]
 .RB [ \-r " | " \-b ]
+.RB [ \-n
+.IR count ]
+.RB [ \-q ]
 .RB [ \-\-timeout= seconds ]
 .RB [ \-o
 .IR file ]
@@ -52,9 +55,21 @@ UDP datagrams sent to specified port numbers.
 Each session runs over IPv4 or IPv6, chosen by the address the client
 connects to.
 .PP
-Both the client and the server must be run with root privileges (or
-.BR CAP_NET_RAW )
-because ICMP probing requires a raw socket.
+Both the client and the server need the
+.B CAP_NET_RAW
+capability for ICMP raw sockets, and
+.B CAP_NET_BIND_SERVICE
+to probe ports below 1024.
+.B make install
+grants both with
+.BR setcap (8);
+otherwise run as root.
+.B chkbounce
+must not be installed setuid root: it writes the files named by
+.BR \-o ,
+.B \-\-csv
+and
+.BR \-\-json .
 .
 .SH MODES
 .TP
@@ -142,6 +157,28 @@ and the report shows both results side by side, marking probes whose
 results differ as
 .BR ASYMMETRIC .
 .TP
+.BI \-n " count" "\fR,\fP \-\-count=" count
+Sweep the whole probe list
+.I count
+times (1\(en127, default 1).
+The report shows
+.IR k / count
+for each probe and direction.
+A probe is marked
+.B ASYMMETRIC
+only if it arrived at least once in one direction and never in the other.
+.TP
+.BR \-q ", " \-\-quote
+Send ICMP error types (ICMPv4 3, 4, 5, 11, 12, 31, 40; ICMPv6 0\(en127)
+as quoted errors.
+The probe's receiver first sends a UDP primer datagram from a fresh port
+to the error sender, creating state in stateful middleboxes; the error
+sender then sends the error (code 0) quoting that primer, using the
+primer's observed source when it arrived.
+The receiver matches the error by type and quoted UDP source port, and
+waits up to two timeouts.
+Other ICMP types and TCP/UDP probes are unaffected.
+.TP
 .BI \-o " file" "\fR,\fP \-\-output=" file
 Write the final report to
 .I file
@@ -154,8 +191,8 @@ Append results to
 .I file
 as CSV, one row per probe and direction, with the columns
 .IR run_start ", " version ", " family ", " server_host ", " server_addr ", "
-.IR client_addr ", " timeout_sec ", " proto ", " number ", " direction ", "
-.IR received ", " probe_time .
+.IR client_addr ", " timeout_sec ", " proto ", " number ", " quoted ", "
+.IR attempt ", " direction ", " received ", " primed ", " probe_time .
 A header row is written if the file is new or empty.
 .TP
 .BI \-\-json= file
@@ -341,6 +378,11 @@ sudo chkbounce \-c 192.168.1.50 \-t22,80,443 \-\-output=report.txt
 sudo chkbounce \-c firewall.internal \-p 5000 \-\-timeout=3 \e
                \-i0,3,8 \-t22,80,443 \-u53,123 \-\-output=/tmp/fw\-report.txt
 .fi
+.SS Compare plain and quoted ICMP errors, five rounds each
+.nf
+sudo chkbounce \-c 192.168.1.50 \-b \-n5 \-i \-\-csv=errors.csv
+sudo chkbounce \-c 192.168.1.50 \-b \-n5 \-i \-q \-\-csv=errors.csv
+.fi
 .SS Compare both directions of a path
 .nf
 sudo chkbounce \-c 192.168.1.50 \-b \-i \-t22,80,443
@@ -363,12 +405,15 @@ and
 .B \-6
 to compare both families on a dual\-stack path.
 .TP
-.B ICMP probe tagging
+.B Probe tagging
 ICMP probes carry identifier 0xCB0C and sequence number
-.RI ( type " << 1) | " direction ,
-and receivers only count a probe whose type and sequence number match.
+.RI ( attempt " << 9) | ((" type " & 0xff) << 1) | " direction ,
+and UDP probes carry the same tag after the string
+.BR chkbounce .
+Receivers only count a probe whose tag matches.
 This keeps kernel\-generated replies to earlier probes (for example an Echo
-Reply sent back for an Echo Request probe) from being counted as later probes.
+Reply sent back for an Echo Request probe) and late copies of earlier
+attempts from being counted.
 Client and server must be built from the same version.
 .TP
 .B One client at a time

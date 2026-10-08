@@ -8,6 +8,14 @@ PREFIX  = /usr
 SBINDIR = $(PREFIX)/sbin
 MAN8DIR = $(PREFIX)/share/man/man8
 
+# The installed binary is NOT setuid (a setuid chkbounce would write -o/--csv/
+# --json files as root for any user).  Instead it gets only the capabilities
+# it needs: raw sockets for ICMP, and binding probe ports below 1024.
+# Packagers who apply capabilities at package-install time can pass SETCAP=
+# to skip this step.
+CAPS    = cap_net_raw,cap_net_bind_service+ep
+SETCAP ?= setcap
+
 all: $(PROGS)
 
 global.o: global.c global.h protocol.h
@@ -35,6 +43,20 @@ install: $(PROGS)
 	install -d $(DESTDIR)$(SBINDIR)
 	install -d $(DESTDIR)$(MAN8DIR)
 	install -m 0755 chkbounce $(DESTDIR)$(SBINDIR)/chkbounce
+	@if [ -z "$(SETCAP)" ]; then \
+		echo "SETCAP is empty: no capabilities set on $(DESTDIR)$(SBINDIR)/chkbounce;"; \
+		echo "run it as root, or later: setcap $(CAPS) $(SBINDIR)/chkbounce"; \
+	elif ! command -v $(SETCAP) >/dev/null 2>&1; then \
+		echo "error: $(SETCAP) not found (install libcap2-bin or libcap)," \
+		     "or rerun with SETCAP= to skip capabilities" >&2; \
+		exit 1; \
+	elif $(SETCAP) $(CAPS) $(DESTDIR)$(SBINDIR)/chkbounce; then \
+		echo "Set capabilities $(CAPS) on $(DESTDIR)$(SBINDIR)/chkbounce"; \
+	else \
+		echo "error: could not set capabilities (needs root, and a filesystem" \
+		     "with extended attributes); rerun with sudo, or with SETCAP= to skip" >&2; \
+		exit 1; \
+	fi
 	install -m 0644 chkbounce.8 $(DESTDIR)$(MAN8DIR)/chkbounce.8
 	gzip -f $(DESTDIR)$(MAN8DIR)/chkbounce.8
 

@@ -16,6 +16,9 @@ struct client_opts {
     int  *icmp_types; int icmp_count;   /* ICMP (or ICMPv6) type numbers */
     int  *tcp_ports;  int tcp_count;
     int  *udp_ports;  int udp_count;
+    int   count;               /* attempts per probe (-n), 1..MAX_ATTEMPTS; the
+                                  whole probe list is swept count times */
+    int   quote;               /* -q: send ICMP error types quoting a primer */
     const char *output_file;   /* text report copy (may be NULL) */
     const char *csv_file;      /* CSV rows appended here (may be NULL) */
     const char *json_file;     /* JSON document written here (may be NULL) */

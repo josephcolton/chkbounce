@@ -71,27 +71,66 @@ struct session {
     int icmp_fd;
     int family;
     int timeout_sec;
+    int server_quote_port;     /* where reverse-probe primers go (MSG_READY) */
     struct sockaddr_storage server;
     struct sockaddr_storage local;
 };
 
+static void send_next(const struct session *s, uint8_t type, const struct result *r,
+                      int port) {
+    struct probe_next_payload pnp;
+    pnp.proto   = (uint8_t)r->proto;
+    pnp.number  = htons((uint16_t)r->number);
+    pnp.attempt = (uint8_t)r->attempt;
+    pnp.flags   = r->quoted ? PROBE_FLAG_QUOTE : 0;
+    pnp.port    = htons((uint16_t)port);
+    send_msg(s->ctrl_fd, type, &pnp, sizeof(pnp));
+}
+
 /* Client sends the probe; the server reports whether it arrived. */
-static int run_forward(const struct session *s, int proto, int number) {
-    struct probe_next_payload pnp = { (uint8_t)proto, htons((uint16_t)number) };
-    send_msg(s->ctrl_fd, MSG_PROBE_NEXT, &pnp, sizeof(pnp));
+static int run_forward(const struct session *s, struct result *r) {
+    uint16_t tag = probe_tag(r->number, r->attempt, 0);
+    int qfd = -1, qport = 0;
 
-    if (expect_msg(s->ctrl_fd, MSG_PROBE_GO, NULL) < 0) {
-        fprintf(stderr, "client: expected MSG_PROBE_GO for %s %d\n",
-                proto_name(proto, s->family), number);
-        return -1;
-    }
-
-    send_probe(&s->server, &s->local, proto, number, s->timeout_sec, 0);
+    /* Quoted: we are the error sender, so open the port the primer comes to */
+    if (r->quoted)
+        qfd = open_udp_local(&s->local, &qport);
+    send_next(s, MSG_PROBE_NEXT, r, qport);
 
     void *payload = NULL;
+    if (expect_msg(s->ctrl_fd, MSG_PROBE_GO, &payload) < 0) {
+        fprintf(stderr, "client: expected MSG_PROBE_GO for %s %d\n",
+                proto_name(r->proto, s->family), r->number);
+        if (qfd >= 0) close(qfd);
+        return -1;
+    }
+    int primer_port = payload ? ntohs(((struct port_payload *)payload)->port) : 0;
+    free(payload);
+
+    if (r->quoted) {
+        /*
+         * Quote the server's primer, using its observed source if it
+         * arrived (correct through NAT), else the server's address and the
+         * port it reported.
+         */
+        struct sockaddr_storage inner_src, inner_dst = s->local;
+        r->fwd_primed = qfd >= 0 && primer_port &&
+                        recv_primer(qfd, s->timeout_sec, tag, &inner_src);
+        if (!r->fwd_primed) {
+            inner_src = s->server;
+            sa_set_port(&inner_src, primer_port);
+        }
+        sa_set_port(&inner_dst, qport);
+        send_icmp_quoted(&s->server, &s->local, r->number, &inner_src, &inner_dst, tag);
+        if (qfd >= 0) close(qfd);
+    } else {
+        send_probe(&s->server, &s->local, r->proto, r->number, s->timeout_sec, tag);
+    }
+
+    payload = NULL;
     if (expect_msg(s->ctrl_fd, MSG_PROBE_RESULT, &payload) < 0 || !payload) {
         fprintf(stderr, "client: expected MSG_PROBE_RESULT for %s %d\n",
-                proto_name(proto, s->family), number);
+                proto_name(r->proto, s->family), r->number);
         free(payload);
         return -1;
     }
@@ -101,20 +140,42 @@ static int run_forward(const struct session *s, int proto, int number) {
 }
 
 /* Client listens; the server sends the probe and says when it has done so. */
-static int run_reverse(const struct session *s, int proto, int number) {
-    int fd = open_probe_socket(s->family, proto, number, s->icmp_fd);
+static int run_reverse(const struct session *s, struct result *r) {
+    uint16_t tag = probe_tag(r->number, r->attempt, 1);
+    int received = 0;
 
-    struct probe_next_payload pnp = { (uint8_t)proto, htons((uint16_t)number) };
-    send_msg(s->ctrl_fd, MSG_RPROBE_REQ, &pnp, sizeof(pnp));
+    if (r->quoted) {
+        /*
+         * We are the error receiver: prime from a fresh port to the server's
+         * quote port, then expect an error quoting that port.  The server may
+         * wait up to a timeout for the primer, so wait two timeouts.
+         */
+        int pport = 0;
+        int pfd = open_udp_local(&s->local, &pport);
+        if (pfd >= 0 && s->server_quote_port)
+            send_tagged(pfd, &s->server, s->server_quote_port, tag);
+        send_next(s, MSG_RPROBE_REQ, r, pport);
+        if (pfd >= 0) {
+            received = wait_icmp_quoted(s->icmp_fd, &s->server, r->number, pport,
+                                        2 * s->timeout_sec);
+            close(pfd);
+        }
+    } else {
+        int fd = open_probe_socket(s->family, r->proto, r->number, s->icmp_fd);
+        send_next(s, MSG_RPROBE_REQ, r, 0);
+        received = wait_probe(r->proto, fd, r->number, &s->server, s->timeout_sec, tag);
+        close_probe_socket(r->proto, fd);
+    }
 
-    int received = wait_probe(proto, fd, number, &s->server, s->timeout_sec, 1);
-    close_probe_socket(proto, fd);
-
-    if (expect_msg(s->ctrl_fd, MSG_RPROBE_SENT, NULL) < 0) {
+    void *payload = NULL;
+    if (expect_msg(s->ctrl_fd, MSG_RPROBE_SENT, &payload) < 0) {
         fprintf(stderr, "client: expected MSG_RPROBE_SENT for %s %d\n",
-                proto_name(proto, s->family), number);
+                proto_name(r->proto, s->family), r->number);
         return -1;
     }
+    if (r->quoted)
+        r->rev_primed = payload ? ((struct rprobe_sent_payload *)payload)->primed : 0;
+    free(payload);
     return received;
 }
 
@@ -138,6 +199,9 @@ void run_client(const struct client_opts *o) {
     info.control_port = o->control_port;
     info.timeout_sec  = o->timeout_sec;
     info.directions   = o->directions;
+    info.nprobes      = total;
+    info.count        = o->count;
+    info.quote        = o->quote;
 
     /* Resolve once; -4/-6 restrict the family, otherwise the resolver picks */
     if (resolve_host(o->server_host, o->family, &s.server) < 0)
@@ -152,6 +216,7 @@ void run_client(const struct client_opts *o) {
            family_name(s.family));
     s.ctrl_fd = ctrl_connect(&s.server, o->control_port);
     if (s.ctrl_fd < 0) return;
+    set_nodelay(s.ctrl_fd);
 
     socklen_t llen = sizeof(s.local);
     if (getsockname(s.ctrl_fd, (struct sockaddr *)&s.local, &llen) < 0) {
@@ -162,19 +227,29 @@ void run_client(const struct client_opts *o) {
     sa_unmap(&s.local);
     sa_ntop(&s.local, info.client_addr, sizeof(info.client_addr));
 
-    struct result *results = calloc(total, sizeof(*results));
+    /* Round-major: entry a * total + i is attempt a of probe i */
+    int nres = total * o->count;
+    struct result *results = calloc(nres, sizeof(*results));
     if (!results) { close(s.ctrl_fd); return; }
 
-    int ridx = 0;
-    for (int i = 0; i < o->icmp_count; i++, ridx++)
-        results[ridx] = (struct result){ .proto = PROTO_ICMP, .number = o->icmp_types[i] };
-    for (int i = 0; i < o->tcp_count; i++, ridx++)
-        results[ridx] = (struct result){ .proto = PROTO_TCP, .number = o->tcp_ports[i] };
-    for (int i = 0; i < o->udp_count; i++, ridx++)
-        results[ridx] = (struct result){ .proto = PROTO_UDP, .number = o->udp_ports[i] };
-    for (int i = 0; i < total; i++)
-        results[i].fwd = results[i].rev = -1;
+    for (int a = 0; a < o->count; a++) {
+        struct result *r = &results[a * total];
+        for (int i = 0; i < o->icmp_count; i++, r++)
+            *r = (struct result){ .proto = PROTO_ICMP, .number = o->icmp_types[i] };
+        for (int i = 0; i < o->tcp_count; i++, r++)
+            *r = (struct result){ .proto = PROTO_TCP, .number = o->tcp_ports[i] };
+        for (int i = 0; i < o->udp_count; i++, r++)
+            *r = (struct result){ .proto = PROTO_UDP, .number = o->udp_ports[i] };
+    }
+    for (int j = 0; j < nres; j++) {
+        struct result *r = &results[j];
+        r->attempt = j / total;
+        r->quoted  = o->quote && r->proto == PROTO_ICMP &&
+                     icmp_is_error(s.family, r->number);
+        r->fwd = r->rev = r->fwd_primed = r->rev_primed = -1;
+    }
 
+    /* The first round lists every probe once */
     if (send_negotiate(s.ctrl_fd, results, total) < 0) {
         fprintf(stderr, "client: send_negotiate failed\n");
         close(s.ctrl_fd);
@@ -182,13 +257,20 @@ void run_client(const struct client_opts *o) {
         return;
     }
 
-    if (expect_msg(s.ctrl_fd, MSG_READY, NULL) < 0) {
+    void *payload = NULL;
+    if (expect_msg(s.ctrl_fd, MSG_READY, &payload) < 0) {
         fprintf(stderr, "client: expected MSG_READY\n");
         close(s.ctrl_fd);
         free(results);
         return;
     }
-    printf("Server ready. Sending %d probes...\n\n", total);
+    s.server_quote_port = payload ? ntohs(((struct port_payload *)payload)->port) : 0;
+    free(payload);
+
+    if (o->count > 1)
+        printf("Server ready. Sending %d probes x %d attempts...\n\n", total, o->count);
+    else
+        printf("Server ready. Sending %d probes...\n\n", total);
     timestamp_utc(info.start, sizeof(info.start));
 
     /* Reverse ICMP probes are received on one raw socket for the session */
@@ -196,21 +278,20 @@ void run_client(const struct client_opts *o) {
         s.icmp_fd = open_icmp_raw(s.family);
 
     int done = 0;
-    for (; done < total; done++) {
+    for (; done < nres; done++) {
         struct result *r = &results[done];
         if (o->directions & DIR_FORWARD) {
-            r->fwd = run_forward(&s, r->proto, r->number);
+            r->fwd = run_forward(&s, r);
             if (r->fwd < 0) break;
             timestamp_utc(r->fwd_time, sizeof(r->fwd_time));
         }
         if (o->directions & DIR_REVERSE) {
-            r->rev = run_reverse(&s, r->proto, r->number);
+            r->rev = run_reverse(&s, r);
             if (r->rev < 0) break;
             timestamp_utc(r->rev_time, sizeof(r->rev_time));
         }
     }
     timestamp_utc(info.end, sizeof(info.end));
-
     if (s.icmp_fd >= 0) close(s.icmp_fd);
     send_msg(s.ctrl_fd, MSG_DONE, NULL, 0);
     close(s.ctrl_fd);

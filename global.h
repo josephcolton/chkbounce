@@ -36,7 +36,8 @@ int resolve_host(const char *host, int family, struct sockaddr_storage *out);
 /* sizeof the concrete sockaddr for ss->ss_family. */
 socklen_t sa_len(const struct sockaddr_storage *ss);
 
-/* Set/clear the port (network order conversion done here). */
+/* Get/set the port (host order; network order conversion done here). */
+int  sa_get_port(const struct sockaddr_storage *ss);
 void sa_set_port(struct sockaddr_storage *ss, int port);
 
 /* Convert an IPv4-mapped AF_INET6 address to AF_INET in place. */
@@ -51,12 +52,21 @@ const char *sa_ntop(const struct sockaddr_storage *ss, char *buf, size_t len);
 /* "IPv4" or "IPv6" */
 const char *family_name(int family);
 
+/*
+ * 1 if this ICMP type is an error message (one that quotes the packet that
+ * caused it): ICMPv6 types 0-127; ICMPv4 types 3, 4, 5, 11, 12, 31, 40.
+ */
+int icmp_is_error(int family, int type);
+
 /* Write/read exactly n bytes, looping over partial I/O. Returns 0 on success. */
 int write_all(int fd, const void *buf, size_t n);
 int read_all(int fd, void *buf, size_t n);
 
 /* Send a framed control-channel message; payload may be NULL when len==0. */
 int send_msg(int fd, uint8_t type, const void *payload, uint32_t len);
+
+/* Disable Nagle on a control connection: the protocol is lock-step and latency-bound. */
+void set_nodelay(int fd);
 
 /*
  * Receive a framed control-channel message.
