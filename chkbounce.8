@@ -19,6 +19,7 @@ chkbounce \- network packet reachability tester
 .RB [ \-i [ types ]]
 .RB [ \-t [ ports ]]
 .RB [ \-u [ ports ]]
+.RB [ \-r " | " \-b ]
 .RB [ \-\-timeout= seconds ]
 .RB [ \-o
 .IR file ]
@@ -107,6 +108,19 @@ If
 .I ports
 is omitted, the default set is used:
 .BR "53, 123, 161" .
+.TP
+.BR \-r ", " \-\-reverse
+Reverse the probe direction: the server sends each probe to the client
+and the client reports whether it arrived.
+The server sends to the client address it sees on the control connection,
+so reverse probes to a client behind NAT will generally not arrive.
+.TP
+.BR \-b ", " \-\-both
+Run every probe in both directions.
+Each probe is sent client\(->server and then immediately server\(->client,
+and the report shows both results side by side, marking probes whose
+results differ as
+.BR ASYMMETRIC .
 .TP
 .BI \-o " file" "\fR,\fP \-\-output=" file
 Write the final report to
@@ -217,6 +231,28 @@ Server \(-> Client:
 .IP f.
 For TCP and UDP the per\-probe socket is closed.
 .RE
+.IP
+With
+.B \-r
+or
+.BR \-b ,
+a reverse probe instead proceeds as:
+.RS
+.IP a. 4
+Client opens its own probe socket.
+.IP b.
+Client \(-> Server:
+.I rprobe\-req
+(protocol, port/type number).
+.IP c.
+Server sends the probe packet to the client.
+.IP d.
+Server \(-> Client:
+.IR rprobe\-sent .
+The client waits up to its own
+.B \-\-timeout
+for the probe and records the result itself.
+.RE
 .IP 5.
 Client sends
 .IR done .
@@ -267,6 +303,10 @@ sudo chkbounce \-c 192.168.1.50 \-t22,80,443 \-\-output=report.txt
 sudo chkbounce \-c firewall.internal \-p 5000 \-\-timeout=3 \e
                \-i0,3,8 \-t22,80,443 \-u53,123 \-\-output=/tmp/fw\-report.txt
 .fi
+.SS Compare both directions of a path
+.nf
+sudo chkbounce \-c 192.168.1.50 \-b \-i \-t22,80,443
+.fi
 .SS Loopback test (client and server on the same machine)
 .nf
 # Terminal 1
@@ -300,6 +340,10 @@ a NAT mismatch can cause false
 results for those protocols.
 TCP probes are unaffected because the NAT gateway rewrites the source address
 consistently.
+.TP
+.B Version compatibility
+Reverse probing (\fB\-r\fP, \fB\-b\fP) needs a server built with the same
+feature; an older server ignores the request and the client will hang.
 .TP
 .B Host firewalls
 A firewall on the server machine (e.g.\&

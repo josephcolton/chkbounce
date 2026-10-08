@@ -19,7 +19,7 @@ static void usage(const char *prog) {
     fprintf(stderr,
         "Usage:\n"
         "  %s -s [-p PORT] [--timeout=SECS]\n"
-        "  %s -c SERVER [-p PORT] [-i[TYPES]] [-t[PORTS]] [-u[PORTS]] [--timeout=SECS]\n"
+        "  %s -c SERVER [-p PORT] [-i[TYPES]] [-t[PORTS]] [-u[PORTS]] [-r|-b] [--timeout=SECS]\n"
         "\n"
         "  SERVER may be a hostname or dotted-decimal IPv4 address.\n"
         "\n"
@@ -36,6 +36,8 @@ static void usage(const char *prog) {
         "  -i[TYPES], --icmp[=TYPES]  ICMP type probes (default: 0-255)\n"
         "  -t[PORTS], --tcp[=PORTS]   TCP port probes  (default: %s)\n"
         "  -u[PORTS], --udp[=PORTS]   UDP port probes  (default: %s)\n"
+        "  -r,        --reverse       Server sends probes to client (server -> client)\n"
+        "  -b,        --both          Test each probe in both directions\n"
         "  -o FILE,   --output=FILE   Write report to FILE in addition to stdout\n",
         prog, prog,
         DEFAULT_CONTROL_PORT, DEFAULT_TIMEOUT,
@@ -100,6 +102,7 @@ int main(int argc, char **argv) {
     int   timeout_sec  = DEFAULT_TIMEOUT;
     char *server_host  = NULL;
     char *output_file  = NULL;
+    int   directions   = DIR_FORWARD;
     const char *icmp_str = NULL;
     const char *tcp_str  = NULL;
     const char *udp_str  = NULL;
@@ -113,12 +116,14 @@ int main(int argc, char **argv) {
         { "tcp",     optional_argument, NULL, 't' },
         { "udp",     optional_argument, NULL, 'u' },
         { "output",  required_argument, NULL, 'o' },
+        { "reverse", no_argument,       NULL, 'r' },
+        { "both",    no_argument,       NULL, 'b' },
         { NULL, 0, NULL, 0 }
     };
 
     int opt, lidx;
     /* Note: optional_argument for short opts requires no space (-t80, not -t 80) */
-    while ((opt = getopt_long(argc, argv, "scp:T:i::t::u::o:", long_opts, &lidx)) != -1) {
+    while ((opt = getopt_long(argc, argv, "scp:T:i::t::u::o:rb", long_opts, &lidx)) != -1) {
         switch (opt) {
         case 's': mode = MODE_SERVER; break;
         case 'c': mode = MODE_CLIENT; break;
@@ -128,6 +133,8 @@ int main(int argc, char **argv) {
         case 't': tcp_str    = optarg ? optarg : default_tcp_str;  break;
         case 'u': udp_str    = optarg ? optarg : default_udp_str;  break;
         case 'o': output_file = optarg; break;
+        case 'r': directions = DIR_REVERSE; break;
+        case 'b': directions = DIR_BOTH;    break;
         default:
             usage(argv[0]);
             return 1;
@@ -179,7 +186,7 @@ int main(int argc, char **argv) {
                icmp_types, icmp_count,
                tcp_ports,  tcp_count,
                udp_ports,  udp_count,
-               output_file);
+               directions, output_file);
 
     free(icmp_types);
     free(tcp_ports);

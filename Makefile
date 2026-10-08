@@ -1,6 +1,6 @@
 PROGS   = chkbounce
-OBJS    = global.o packets.o server.o client.o
-HEADERS = global.h protocol.h packets.h server.h client.h
+OBJS    = global.o packets.o receive.o server.o client.o
+HEADERS = global.h protocol.h packets.h receive.h server.h client.h
 CFLAGS  = -Wall -Wextra -O2
 
 PREFIX  = /usr
@@ -12,13 +12,16 @@ all: $(PROGS)
 global.o: global.c global.h protocol.h
 	gcc $(CFLAGS) -c global.c
 
-packets.o: packets.c packets.h global.h
+packets.o: packets.c packets.h global.h protocol.h
 	gcc $(CFLAGS) -c packets.c
 
-server.o: server.c server.h global.h protocol.h
+receive.o: receive.c receive.h protocol.h
+	gcc $(CFLAGS) -c receive.c
+
+server.o: server.c server.h global.h protocol.h packets.h receive.h
 	gcc $(CFLAGS) -c server.c
 
-client.o: client.c client.h global.h protocol.h packets.h
+client.o: client.c client.h global.h protocol.h packets.h receive.h
 	gcc $(CFLAGS) -c client.c
 
 chkbounce: chkbounce.c $(OBJS) $(HEADERS)

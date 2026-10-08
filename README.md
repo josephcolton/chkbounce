@@ -11,6 +11,7 @@
 - Tests UDP reachability by sending datagrams
 - Flexible range syntax for specifying what to probe (`22,25-30,80,443`)
 - Per-probe configurable timeout
+- Tests either direction of the path (client→server, server→client) or both, flagging asymmetric results
 - Server runs persistently and handles multiple client sessions sequentially
 - Client accepts both hostnames and IPv4 addresses for the server
 - Lock-step protocol: the server opens exactly one socket at a time, just before each probe is sent, so there is no limit on the number of probes in a session
@@ -97,6 +98,8 @@ chkbounce -c SERVER [OPTIONS]
 | `-i[TYPES]`, `--icmp[=TYPES]` | Enable ICMP probes.  `TYPES` is a range list of ICMP type numbers (0–255).  Omit `TYPES` to probe all 256 types. |
 | `-t[PORTS]`, `--tcp[=PORTS]` | Enable TCP probes.  `PORTS` is a range list of port numbers.  Omit `PORTS` to use the default port list. |
 | `-u[PORTS]`, `--udp[=PORTS]` | Enable UDP probes.  `PORTS` is a range list of port numbers.  Omit `PORTS` to use the default port list. |
+| `-r`, `--reverse` | Reverse direction: the server sends each probe to the client, and the client reports what arrived |
+| `-b`, `--both` | Run each probe in both directions (forward, then immediately reverse) and mark results that differ as `ASYMMETRIC` |
 | `-o FILE`, `--output=FILE` | Write the final report to `FILE` in addition to printing it to stdout.  The file is created or overwritten.  Progress and connection messages are not written to the file. |
 
 **Default port lists** (used when the flag is given without an explicit list):
@@ -188,6 +191,12 @@ sudo chkbounce -c 192.168.1.50 -t22,80,443,8080-8090
 sudo chkbounce -c 192.168.1.50 -u53,67-69,123,161
 ```
 
+### Compare both directions of a path
+
+```sh
+sudo chkbounce -c 192.168.1.50 -b -i -t22,80,443
+```
+
 ### Save the report to a file
 
 ```sh
@@ -227,7 +236,13 @@ chkbounce uses a TCP control channel (default port 1234) to coordinate the probe
    2. Server → Client: *"Socket is open and listening."*  (The server opens exactly one socket here, immediately before the probe is fired.)
    3. Client sends the probe packet (ICMP, TCP connect, or UDP datagram) to the server.
    4. Server → Client: *"Received"* (immediately on receipt) or *"Not received"* (after the per-probe timeout expires).
-4. **Done** — After the last probe the client sends a *done* message, the server closes the client session, and the server loops back to accept the next incoming client.
+4. **Reverse probes** (`-r` / `-b`) — the roles swap for that probe:
+   1. Client opens its own listening socket, then sends *"Send me this port/type."*
+   2. Server sends the probe packet to the client's address (as seen on the control connection).
+   3. Server → Client: *"Sent."*  The client waits up to its own timeout and records the result itself.
+
+   With `-b`, each probe runs forward and then immediately in reverse, so the two results are close in time.
+5. **Done** — After the last probe the client sends a *done* message, the server closes the client session, and the server loops back to accept the next incoming client.
 
 ### Per-probe socket lifecycle
 
@@ -255,6 +270,7 @@ Connecting to 192.168.1.50:1234
 Server ready. Sending 9 probes...
 
 === chkbounce Report ===
+Direction: client -> server
 
 ICMP Probes:
   Type   0: RECEIVED
@@ -271,7 +287,7 @@ UDP Probes:
   Port   123: not received
   Port   161: not received
 
-Summary: 4 of 9 probes received
+Summary: client->server 4 of 9 received
 ```
 
 ---
@@ -283,6 +299,8 @@ Summary: 4 of 9 probes received
 - **Root required** — Both client and server must run as root (or with `CAP_NET_RAW`) because ICMP probing uses raw sockets.
 - **Privileged ports** — Binding TCP or UDP ports below 1024 on the server requires root.
 - **NAT** — If the client is behind NAT, the server sees the NAT gateway's IP, which may not match the source IP of raw ICMP packets sent by the client.  TCP and UDP probes are unaffected because the kernel handles their source IP assignment correctly through the NAT mapping.
+- **Reverse probes and NAT** — Reverse probes are sent to the client's public (NAT) address, so they will generally not reach a client behind NAT unless the NAT forwards them.
+- **Version compatibility** — `-r` and `-b` need a server built with reverse-probe support; an older server ignores the request and the client hangs.
 - **Host firewalls** — A firewall on the server machine (e.g., `iptables`, `nftables`) may block probe packets before they reach the listening socket, causing false *not received* results.
 
 ---

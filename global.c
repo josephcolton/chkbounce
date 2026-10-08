@@ -10,6 +10,15 @@
 #include "global.h"
 #include "protocol.h"
 
+const char *proto_name(int proto) {
+    switch (proto) {
+    case PROTO_ICMP: return "ICMP";
+    case PROTO_TCP:  return "TCP";
+    case PROTO_UDP:  return "UDP";
+    }
+    return "?";
+}
+
 unsigned short checksum(void *addr, int count) {
     unsigned int sum = 0, value = 0;
     while (count > 1) {

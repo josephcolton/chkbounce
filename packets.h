@@ -13,4 +13,10 @@ int send_tcp_probe(const char *dstip, int port, int timeout_sec);
 /* Send a single UDP datagram to dstip:port. Returns bytes sent or -1. */
 int send_udp_probe(const char *dstip, int port);
 
+/*
+ * Send one probe of the given PROTO_* type.  number is the ICMP type or the
+ * TCP/UDP port.  Return value is that of the per-protocol function above.
+ */
+int send_probe(const char *dstip, int proto, int number, int timeout_sec);
+
 #endif /* PACKETS_H */

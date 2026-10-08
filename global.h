@@ -11,6 +11,9 @@
 #define ICMP_UNREACH 3
 #define ICMP_ECHO    8
 
+/* "ICMP", "TCP", "UDP" for a PROTO_* value; "?" otherwise. */
+const char *proto_name(int proto);
+
 /* RFC 1071 checksum over count bytes starting at addr */
 unsigned short checksum(void *addr, int count);
 

@@ -11,6 +11,7 @@
 #include <sys/time.h>
 
 #include "global.h"
+#include "protocol.h"
 #include "packets.h"
 
 /* ICMP header without the 56-byte data payload used for raw sends */
@@ -112,4 +113,11 @@ int send_udp_probe(const char *dstip, int port) {
 
     close(fd);
     return bytes;
+}
+
+int send_probe(const char *dstip, int proto, int number, int timeout_sec) {
+    if (proto == PROTO_ICMP) return send_icmp_probe(dstip, number);
+    if (proto == PROTO_TCP)  return send_tcp_probe(dstip, number, timeout_sec);
+    if (proto == PROTO_UDP)  return send_udp_probe(dstip, number);
+    return -1;
 }

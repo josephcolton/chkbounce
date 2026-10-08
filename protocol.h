@@ -15,6 +15,8 @@
 #define MSG_PROBE_GO     4   /* server->client: ready for this probe */
 #define MSG_PROBE_RESULT 5   /* server->client: received or not */
 #define MSG_DONE         6   /* client->server: all probes sent */
+#define MSG_RPROBE_REQ   7   /* client->server: send me this probe (reverse) */
+#define MSG_RPROBE_SENT  8   /* server->client: reverse probe has been sent */
 
 #define DEFAULT_CONTROL_PORT 1234
 #define DEFAULT_TIMEOUT      2
@@ -32,10 +34,19 @@
  * MSG_PROBE_NEXT payload:
  *   [1 byte: proto][2 bytes: number]
  *
+ * MSG_RPROBE_REQ payload: same layout as MSG_PROBE_NEXT.
+ *
  * MSG_PROBE_RESULT payload:
  *   [1 byte: proto][2 bytes: number][1 byte: received (0 or 1)]
  *
- * MSG_READY, MSG_PROBE_GO, MSG_DONE: zero-length payload.
+ * MSG_READY, MSG_PROBE_GO, MSG_DONE, MSG_RPROBE_SENT: zero-length payload.
+ *
+ * Forward probe (client -> server):
+ *   PROBE_NEXT -> PROBE_GO -> client sends probe -> PROBE_RESULT
+ *
+ * Reverse probe (server -> client), client already listening:
+ *   RPROBE_REQ -> server sends probe -> RPROBE_SENT
+ *   The client decides received/not itself; no result message is needed.
  */
 
 #pragma pack(push, 1)
