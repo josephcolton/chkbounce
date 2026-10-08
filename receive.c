@@ -5,34 +5,45 @@
 #include <errno.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/icmp6.h>
 #include <sys/socket.h>
 #include <sys/select.h>
 #include <sys/time.h>
 
+#include "global.h"
 #include "protocol.h"
 #include "receive.h"
 
 /* ----------------------------------------------------------------- socket helpers */
 
-static int open_tcp_listen(int port) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) { perror("TCP socket"); return -1; }
+/* Socket of type bound to the wildcard address of family on port. */
+static int open_bound(int family, int type, int port) {
+    int fd = socket(family, type, 0);
+    if (fd < 0) { perror(type == SOCK_STREAM ? "TCP socket" : "UDP socket"); return -1; }
 
     int on = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+    /* Keep v6 sockets v6-only so IPv4-mapped peers can't slip in */
+    if (family == AF_INET6)
+        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof(on));
 
-    struct sockaddr_in addr;
+    struct sockaddr_storage addr;
     memset(&addr, 0, sizeof(addr));
-    addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port        = htons(port);
+    addr.ss_family = family;   /* zeroed address = INADDR_ANY / in6addr_any */
+    sa_set_port(&addr, port);
 
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        fprintf(stderr, "bind TCP %d: %s\n", port, strerror(errno));
+    if (bind(fd, (struct sockaddr *)&addr, sa_len(&addr)) < 0) {
+        fprintf(stderr, "bind %s %d: %s\n", type == SOCK_STREAM ? "TCP" : "UDP",
+                port, strerror(errno));
         close(fd);
         return -1;
     }
-    if (listen(fd, 4) < 0) {
+    return fd;
+}
+
+static int open_tcp_listen(int family, int port) {
+    int fd = open_bound(family, SOCK_STREAM, port);
+    if (fd >= 0 && listen(fd, 4) < 0) {
         perror("listen");
         close(fd);
         return -1;
@@ -40,46 +51,35 @@ static int open_tcp_listen(int port) {
     return fd;
 }
 
-static int open_udp_bind(int port) {
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) { perror("UDP socket"); return -1; }
-
-    int on = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port        = htons(port);
-
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        fprintf(stderr, "bind UDP %d: %s\n", port, strerror(errno));
-        close(fd);
+int open_icmp_raw(int family) {
+    int v6 = family == AF_INET6;
+    int fd = socket(family, SOCK_RAW, v6 ? IPPROTO_ICMPV6 : IPPROTO_ICMP);
+    if (fd < 0) {
+        perror(v6 ? "ICMPv6 raw socket (ICMP probes will fail)"
+                  : "ICMP raw socket (ICMP probes will fail)");
         return -1;
+    }
+    if (v6) {
+        /* Deliver every ICMPv6 type; don't rely on the kernel default */
+        struct icmp6_filter filt;
+        ICMP6_FILTER_SETPASSALL(&filt);
+        setsockopt(fd, IPPROTO_ICMPV6, ICMP6_FILTER, &filt, sizeof(filt));
     }
     return fd;
 }
 
-int open_icmp_raw(void) {
-    int fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
-    if (fd < 0)
-        perror("ICMP raw socket (ICMP probes will fail)");
-    return fd;
-}
-
-int open_probe_socket(int proto, int number, int icmp_fd) {
+int open_probe_socket(int family, int proto, int number, int icmp_fd) {
     int fd = -1;
     if (proto == PROTO_ICMP) {
         fd = icmp_fd;
     } else if (proto == PROTO_TCP) {
-        fd = open_tcp_listen(number);
+        fd = open_tcp_listen(family, number);
         if (fd >= 0)
             printf("Listening TCP %d\n", number);
         else
             fprintf(stderr, "could not open TCP %d\n", number);
     } else if (proto == PROTO_UDP) {
-        fd = open_udp_bind(number);
+        fd = open_bound(family, SOCK_DGRAM, number);
         if (fd >= 0)
             printf("Listening UDP %d\n", number);
         else
@@ -117,70 +117,92 @@ static int timed_select(int fd, struct timeval *tv) {
 
 /* ------------------------------------------------------------------ probe wait */
 
-static int wait_icmp(int icmp_fd, uint32_t src_ip_net,
-                     int expected_type, int timeout_sec) {
+static int wait_icmp(int icmp_fd, const struct sockaddr_storage *peer,
+                     int expected_type, int timeout_sec, int reverse) {
     struct timeval tv = { timeout_sec, 0 };
     char buf[4096];
+    char ip[INET6_ADDRSTRLEN];
+    uint16_t want_seq = probe_icmp_seq(expected_type, reverse);
 
     while (1) {
         if (timed_select(icmp_fd, &tv) <= 0) break;
 
-        struct sockaddr_in src;
+        struct sockaddr_storage src;
         socklen_t slen = sizeof(src);
         int bytes = recvfrom(icmp_fd, buf, sizeof(buf), 0,
                              (struct sockaddr *)&src, &slen);
         if (bytes < 0) break;
-        if (src.sin_addr.s_addr != src_ip_net) continue;
+        if (!sa_same_addr(&src, peer)) continue;
 
-        int ihl = ((unsigned char)buf[0] & 0x0f) * 4;
-        if (bytes < ihl + 1) continue;
-        int got_type = (unsigned char)buf[ihl];
+        /* Raw IPv4 sockets include the IP header; raw ICMPv6 sockets don't */
+        int off = 0;
+        if (src.ss_family == AF_INET)
+            off = ((unsigned char)buf[0] & 0x0f) * 4;
+        if (bytes < off + 8) continue;
 
-        printf("  ICMP type %d from %s\n", got_type, inet_ntoa(src.sin_addr));
-        if (got_type == expected_type) return 1;
+        int got_type = (unsigned char)buf[off];
+        uint16_t got_seq;
+        memcpy(&got_seq, buf + off + 6, 2);
+        got_seq = ntohs(got_seq);
+
+        if (got_type == expected_type && got_seq == want_seq) {
+            printf("  ICMP type %d from %s\n", got_type, sa_ntop(&src, ip, sizeof(ip)));
+            return 1;
+        }
+        printf("  ICMP type %d from %s (ignored: not this probe)\n",
+               got_type, sa_ntop(&src, ip, sizeof(ip)));
     }
     return 0;
 }
 
-static int wait_tcp(int fd, int port, int timeout_sec) {
+static int wait_tcp(int fd, int port, const struct sockaddr_storage *peer,
+                    int timeout_sec) {
     struct timeval tv = { timeout_sec, 0 };
-    if (timed_select(fd, &tv) <= 0) return 0;
+    char ip[INET6_ADDRSTRLEN];
 
-    struct sockaddr_in src;
-    socklen_t slen = sizeof(src);
-    int conn = accept(fd, (struct sockaddr *)&src, &slen);
-    if (conn < 0) return 0;
-    printf("  TCP port %d from %s\n", port, inet_ntoa(src.sin_addr));
-    close(conn);
-    return 1;
+    while (1) {
+        if (timed_select(fd, &tv) <= 0) return 0;
+
+        struct sockaddr_storage src;
+        socklen_t slen = sizeof(src);
+        int conn = accept(fd, (struct sockaddr *)&src, &slen);
+        if (conn < 0) return 0;
+        close(conn);
+        if (!sa_same_addr(&src, peer)) continue;
+        printf("  TCP port %d from %s\n", port, sa_ntop(&src, ip, sizeof(ip)));
+        return 1;
+    }
 }
 
-static int wait_udp(int fd, int port, uint32_t src_ip_net, int timeout_sec) {
+static int wait_udp(int fd, int port, const struct sockaddr_storage *peer,
+                    int timeout_sec) {
     struct timeval tv = { timeout_sec, 0 };
     char buf[512];
+    char ip[INET6_ADDRSTRLEN];
 
     while (1) {
         if (timed_select(fd, &tv) <= 0) break;
 
-        struct sockaddr_in src;
+        struct sockaddr_storage src;
         socklen_t slen = sizeof(src);
         int bytes = recvfrom(fd, buf, sizeof(buf), 0,
                              (struct sockaddr *)&src, &slen);
         if (bytes < 0) break;
-        if (src.sin_addr.s_addr != src_ip_net) continue;
-        printf("  UDP port %d from %s\n", port, inet_ntoa(src.sin_addr));
+        if (!sa_same_addr(&src, peer)) continue;
+        printf("  UDP port %d from %s\n", port, sa_ntop(&src, ip, sizeof(ip)));
         return 1;
     }
     return 0;
 }
 
-int wait_probe(int proto, int fd, int number, uint32_t src_ip_net, int timeout_sec) {
+int wait_probe(int proto, int fd, int number, const struct sockaddr_storage *peer,
+               int timeout_sec, int reverse) {
     if (fd < 0) return 0;
     if (proto == PROTO_ICMP)
-        return wait_icmp(fd, src_ip_net, number, timeout_sec);
+        return wait_icmp(fd, peer, number, timeout_sec, reverse);
     if (proto == PROTO_TCP)
-        return wait_tcp(fd, number, timeout_sec);
+        return wait_tcp(fd, number, peer, timeout_sec);
     if (proto == PROTO_UDP)
-        return wait_udp(fd, number, src_ip_net, timeout_sec);
+        return wait_udp(fd, number, peer, timeout_sec);
     return 0;
 }

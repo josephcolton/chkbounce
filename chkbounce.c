@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <getopt.h>
+#include <sys/socket.h>
 
 #include "protocol.h"
 #include "server.h"
@@ -15,13 +16,19 @@ static const char default_tcp_str[] = "22,80,443,8080,8443";
 static const char default_udp_str[] = "53,123,161";
 static const char default_icmp_str[] = "0-255";
 
+#ifndef CHKBOUNCE_VERSION
+#define CHKBOUNCE_VERSION "unknown"
+#endif
+
 static void usage(const char *prog) {
     fprintf(stderr,
         "Usage:\n"
-        "  %s -s [-p PORT] [--timeout=SECS]\n"
-        "  %s -c SERVER [-p PORT] [-i[TYPES]] [-t[PORTS]] [-u[PORTS]] [-r|-b] [--timeout=SECS]\n"
+        "  %s -s [-4|-6] [-p PORT] [--timeout=SECS]\n"
+        "  %s -c SERVER [-4|-6] [-p PORT] [-i[TYPES]] [-t[PORTS]] [-u[PORTS]] [-r|-b]\n"
+        "             [--timeout=SECS] [-o FILE] [--csv=FILE] [--json=FILE]\n"
         "\n"
-        "  SERVER may be a hostname or dotted-decimal IPv4 address.\n"
+        "  SERVER may be a hostname or a numeric IPv4/IPv6 address.\n"
+        "  In IPv6 sessions, -i TYPES are ICMPv6 type numbers.\n"
         "\n"
         "  Ranges use comma-separated values and inclusive N-M ranges:\n"
         "    -i0,3,8-11      ICMP types 0, 3, 8, 9, 10, 11\n"
@@ -31,6 +38,8 @@ static void usage(const char *prog) {
         "Options:\n"
         "  -s, --server           Run in server mode\n"
         "  -c, --client           Run in client mode\n"
+        "  -4, --ipv4             Use IPv4 only (server: accept IPv4 clients only)\n"
+        "  -6, --ipv6             Use IPv6 only (server: accept IPv6 clients only)\n"
         "  -p, --port=NUM         Control channel TCP port (default: %d)\n"
         "      --timeout=NUM      Per-probe timeout in seconds (default: %d)\n"
         "  -i[TYPES], --icmp[=TYPES]  ICMP type probes (default: 0-255)\n"
@@ -38,7 +47,10 @@ static void usage(const char *prog) {
         "  -u[PORTS], --udp[=PORTS]   UDP port probes  (default: %s)\n"
         "  -r,        --reverse       Server sends probes to client (server -> client)\n"
         "  -b,        --both          Test each probe in both directions\n"
-        "  -o FILE,   --output=FILE   Write report to FILE in addition to stdout\n",
+        "  -o FILE,   --output=FILE   Write report to FILE in addition to stdout\n"
+        "             --csv=FILE      Append results to FILE as CSV (header added if new)\n"
+        "             --json=FILE     Write results to FILE as JSON\n"
+        "  -V,        --version       Print version and exit\n",
         prog, prog,
         DEFAULT_CONTROL_PORT, DEFAULT_TIMEOUT,
         default_tcp_str, default_udp_str);
@@ -102,7 +114,10 @@ int main(int argc, char **argv) {
     int   timeout_sec  = DEFAULT_TIMEOUT;
     char *server_host  = NULL;
     char *output_file  = NULL;
+    char *csv_file     = NULL;
+    char *json_file    = NULL;
     int   directions   = DIR_FORWARD;
+    int   family       = AF_UNSPEC;
     const char *icmp_str = NULL;
     const char *tcp_str  = NULL;
     const char *udp_str  = NULL;
@@ -118,12 +133,17 @@ int main(int argc, char **argv) {
         { "output",  required_argument, NULL, 'o' },
         { "reverse", no_argument,       NULL, 'r' },
         { "both",    no_argument,       NULL, 'b' },
+        { "ipv4",    no_argument,       NULL, '4' },
+        { "ipv6",    no_argument,       NULL, '6' },
+        { "csv",     required_argument, NULL, 'C' },
+        { "json",    required_argument, NULL, 'J' },
+        { "version", no_argument,       NULL, 'V' },
         { NULL, 0, NULL, 0 }
     };
 
     int opt, lidx;
     /* Note: optional_argument for short opts requires no space (-t80, not -t 80) */
-    while ((opt = getopt_long(argc, argv, "scp:T:i::t::u::o:rb", long_opts, &lidx)) != -1) {
+    while ((opt = getopt_long(argc, argv, "scp:T:i::t::u::o:rb46V", long_opts, &lidx)) != -1) {
         switch (opt) {
         case 's': mode = MODE_SERVER; break;
         case 'c': mode = MODE_CLIENT; break;
@@ -135,6 +155,11 @@ int main(int argc, char **argv) {
         case 'o': output_file = optarg; break;
         case 'r': directions = DIR_REVERSE; break;
         case 'b': directions = DIR_BOTH;    break;
+        case '4': family = AF_INET;         break;
+        case '6': family = AF_INET6;        break;
+        case 'C': csv_file  = optarg; break;
+        case 'J': json_file = optarg; break;
+        case 'V': printf("chkbounce %s\n", CHKBOUNCE_VERSION); return 0;
         default:
             usage(argv[0]);
             return 1;
@@ -156,8 +181,14 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /*
+     * Line-buffer stdout so progress and server logs reach a file or pipe
+     * as they happen instead of being lost in the buffer when killed.
+     */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     if (mode == MODE_SERVER) {
-        run_server(control_port, timeout_sec);
+        run_server(control_port, timeout_sec, family);
         return 0;
     }
 
@@ -182,11 +213,20 @@ int main(int argc, char **argv) {
     if (tcp_str)  tcp_ports  = parse_range_list(tcp_str,  &tcp_count);
     if (udp_str)  udp_ports  = parse_range_list(udp_str,  &udp_count);
 
-    run_client(server_host, control_port, timeout_sec,
-               icmp_types, icmp_count,
-               tcp_ports,  tcp_count,
-               udp_ports,  udp_count,
-               directions, output_file);
+    struct client_opts o = {
+        .server_host  = server_host,
+        .control_port = control_port,
+        .timeout_sec  = timeout_sec,
+        .family       = family,
+        .directions   = directions,
+        .icmp_types   = icmp_types, .icmp_count = icmp_count,
+        .tcp_ports    = tcp_ports,  .tcp_count  = tcp_count,
+        .udp_ports    = udp_ports,  .udp_count  = udp_count,
+        .output_file  = output_file,
+        .csv_file     = csv_file,
+        .json_file    = json_file,
+    };
+    run_client(&o);
 
     free(icmp_types);
     free(tcp_ports);

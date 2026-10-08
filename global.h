@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <sys/socket.h>
 
 #define packed __attribute__((packed))
 
@@ -11,18 +12,44 @@
 #define ICMP_UNREACH 3
 #define ICMP_ECHO    8
 
-/* "ICMP", "TCP", "UDP" for a PROTO_* value; "?" otherwise. */
-const char *proto_name(int proto);
+/* "ICMP"/"ICMPv6", "TCP", "UDP" for a PROTO_* value; "?" otherwise. */
+const char *proto_name(int proto, int family);
+
+/* Current time as ISO 8601 UTC with milliseconds (needs >= 25 bytes); returns buf. */
+const char *timestamp_utc(char *buf, size_t len);
 
 /* RFC 1071 checksum over count bytes starting at addr */
 unsigned short checksum(void *addr, int count);
 
 /*
- * Resolve a hostname or dotted-decimal IPv4 address to a dotted-decimal
- * string written into ip_out (at least INET_ADDRSTRLEN bytes).
- * Returns 0 on success, -1 on failure.
+ * Address helpers.  All addresses are carried as sockaddr_storage holding
+ * either AF_INET or AF_INET6; IPv4-mapped IPv6 addresses (::ffff:a.b.c.d)
+ * are converted to plain AF_INET by sa_unmap so comparisons work.
  */
-int resolve_hostname(const char *host, char *ip_out, size_t ip_len);
+
+/*
+ * Resolve a hostname or numeric address.  family is AF_UNSPEC, AF_INET or
+ * AF_INET6.  The port in *out is left 0.  Returns 0 on success, -1 on failure.
+ */
+int resolve_host(const char *host, int family, struct sockaddr_storage *out);
+
+/* sizeof the concrete sockaddr for ss->ss_family. */
+socklen_t sa_len(const struct sockaddr_storage *ss);
+
+/* Set/clear the port (network order conversion done here). */
+void sa_set_port(struct sockaddr_storage *ss, int port);
+
+/* Convert an IPv4-mapped AF_INET6 address to AF_INET in place. */
+void sa_unmap(struct sockaddr_storage *ss);
+
+/* 1 if a and b hold the same IP address (ports ignored), else 0. */
+int sa_same_addr(const struct sockaddr_storage *a, const struct sockaddr_storage *b);
+
+/* Numeric address string (no port) into buf; returns buf. */
+const char *sa_ntop(const struct sockaddr_storage *ss, char *buf, size_t len);
+
+/* "IPv4" or "IPv6" */
+const char *family_name(int family);
 
 /* Write/read exactly n bytes, looping over partial I/O. Returns 0 on success. */
 int write_all(int fd, const void *buf, size_t n);

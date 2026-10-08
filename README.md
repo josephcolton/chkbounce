@@ -1,6 +1,6 @@
 # chkbounce
 
-**chkbounce** is a network diagnostic tool that determines which types of traffic can traverse the path between two hosts.  It operates in a client/server model: a persistent server process listens for incoming client connections, negotiates a set of probes, and reports back in real time which packets it received.  Supported probe types are **ICMP** (all 256 type numbers or a specific subset), **TCP** (by port number), and **UDP** (by port number).
+**chkbounce** is a network diagnostic tool that determines which types of traffic can traverse the path between two hosts.  It operates in a client/server model: a persistent server process listens for incoming client connections, negotiates a set of probes, and reports back in real time which packets it received.  Supported probe types are **ICMP/ICMPv6** (all 256 type numbers or a specific subset), **TCP** (by port number), and **UDP** (by port number), over **IPv4 or IPv6**.
 
 ---
 
@@ -13,7 +13,8 @@
 - Per-probe configurable timeout
 - Tests either direction of the path (client→server, server→client) or both, flagging asymmetric results
 - Server runs persistently and handles multiple client sessions sequentially
-- Client accepts both hostnames and IPv4 addresses for the server
+- IPv4 and IPv6; the client accepts hostnames and numeric addresses, and `-4`/`-6` force a family
+- CSV and JSON export for analysis, with timestamps and tool version on every record
 - Lock-step protocol: the server opens exactly one socket at a time, just before each probe is sent, so there is no limit on the number of probes in a session
 
 ---
@@ -83,7 +84,7 @@ Run the client on the machine that will generate the probe traffic.  The client 
 chkbounce -c SERVER [OPTIONS]
 ```
 
-`SERVER` may be either a hostname (resolved via DNS) or a dotted-decimal IPv4 address.
+`SERVER` may be a hostname (resolved via DNS) or a numeric IPv4 or IPv6 address.  Without `-4`/`-6`, the first address the resolver returns is used.  The session (control connection and all probes) uses that one address family.
 
 ---
 
@@ -93,6 +94,8 @@ chkbounce -c SERVER [OPTIONS]
 |--------|-------------|
 | `-s`, `--server` | Run in server mode |
 | `-c`, `--client` | Run in client mode |
+| `-4`, `--ipv4` | Client: use IPv4.  Server: accept IPv4 clients only. |
+| `-6`, `--ipv6` | Client: use IPv6.  Server: accept IPv6 clients only.  (By default the server accepts both.) |
 | `-p NUM`, `--port=NUM` | TCP port used for the control channel (default: **1234**) |
 | `--timeout=NUM` | Per-probe timeout in seconds (default: **2**) |
 | `-i[TYPES]`, `--icmp[=TYPES]` | Enable ICMP probes.  `TYPES` is a range list of ICMP type numbers (0–255).  Omit `TYPES` to probe all 256 types. |
@@ -101,6 +104,9 @@ chkbounce -c SERVER [OPTIONS]
 | `-r`, `--reverse` | Reverse direction: the server sends each probe to the client, and the client reports what arrived |
 | `-b`, `--both` | Run each probe in both directions (forward, then immediately reverse) and mark results that differ as `ASYMMETRIC` |
 | `-o FILE`, `--output=FILE` | Write the final report to `FILE` in addition to printing it to stdout.  The file is created or overwritten.  Progress and connection messages are not written to the file. |
+| `--csv=FILE` | Append results to `FILE` as CSV, one row per probe and direction.  A header row is written if the file is new or empty, so many runs can be collected in one file. |
+| `--json=FILE` | Write the run (metadata, per-probe results, summary) to `FILE` as one JSON document.  The file is overwritten. |
+| `-V`, `--version` | Print the version (the git commit it was built from) and exit. |
 
 **Default port lists** (used when the flag is given without an explicit list):
 
@@ -197,6 +203,14 @@ sudo chkbounce -c 192.168.1.50 -u53,67-69,123,161
 sudo chkbounce -c 192.168.1.50 -b -i -t22,80,443
 ```
 
+### Probe all ICMPv6 types over IPv6, both directions, saving CSV and JSON
+
+```sh
+sudo chkbounce -6 -c server.example.com -i -b --csv=results.csv --json=run.json
+```
+
+In an IPv6 session, `-i` type numbers are ICMPv6 types (e.g. 128 = Echo Request, 160 = Extended Echo Request).
+
 ### Save the report to a file
 
 ```sh
@@ -250,7 +264,9 @@ Opening one socket per probe (rather than all sockets up front during negotiatio
 
 ### ICMP filtering
 
-The server uses a single `SOCK_RAW / IPPROTO_ICMP` socket and filters incoming packets by the client's source IP address (taken from the control-channel TCP connection) and the expected ICMP type number.  Unrelated ICMP traffic arriving during a probe window is silently discarded.
+The receiver uses a single raw socket per session (`IPPROTO_ICMP` for IPv4, `IPPROTO_ICMPV6` for IPv6) and filters incoming packets by the peer's address (taken from the control-channel TCP connection), the expected type number, and a sequence-number tag.  Every ICMP probe carries the identifier `0xCB0C` and a sequence number of `(type << 1) | direction`.  The tag stops the kernel's automatic reply to an earlier probe from being mistaken for a later one; for example, the Echo Reply (ICMPv6 129) the kernel sends back for a type 128 probe.  Only the sequence number is checked, because NATs rewrite the echo identifier.  Unrelated ICMP traffic arriving during a probe window is discarded.
+
+Probes are sent from the local address of the control connection, so the source-address filter matches even on hosts with several addresses (common with IPv6).
 
 ### Probe methods
 
@@ -262,14 +278,28 @@ The server uses a single `SOCK_RAW / IPPROTO_ICMP` socket and filters incoming p
 
 ---
 
+## Machine-Readable Output
+
+`--csv` writes one row per probe and direction:
+
+```
+run_start,version,family,server_host,server_addr,client_addr,timeout_sec,proto,number,direction,received,probe_time
+2026-10-08T14:44:51.841Z,2d1e46d,IPv4,127.0.0.1,127.0.0.1,127.0.0.1,1,tcp,45080,client_to_server,1,2026-10-08T14:44:51.923Z
+```
+
+`direction` is `client_to_server` or `server_to_client`; `received` is `1` or `0`; `proto` is `icmp`, `tcp` or `udp` (read `icmp` together with `family`: in IPv6 rows the number is an ICMPv6 type).  `client_addr` is the client's own address on the control connection; if it differs from what the server sees, the client is behind NAT.
+
+`--json` writes the same data as one object: run metadata (`version`, `start`, `end`, `family`, addresses, `timeout_sec`, `directions`), a `results` array with `client_to_server` and `server_to_client` entries (`{"received": bool, "time": ...}` or `null` if not tested), and a `summary`.
+
 ## Sample Output
 
 ```
 Resolved server.example.com -> 192.168.1.50
-Connecting to 192.168.1.50:1234
+Connecting to 192.168.1.50 port 1234 (IPv4)
 Server ready. Sending 9 probes...
 
 === chkbounce Report ===
+Client: 192.168.1.10  Server: 192.168.1.50  (IPv4)
 Direction: client -> server
 
 ICMP Probes:
@@ -294,13 +324,14 @@ Summary: client->server 4 of 9 received
 
 ## Limitations
 
-- **IPv4 only** — IPv6 is not supported.
+- **One family per session** — To compare IPv4 and IPv6 on a dual-stack path, run the client twice (`-4` and `-6`) against the same server.
 - **Sequential clients** — The server handles one client at a time.  A second client must wait until the current session completes.
 - **Root required** — Both client and server must run as root (or with `CAP_NET_RAW`) because ICMP probing uses raw sockets.
 - **Privileged ports** — Binding TCP or UDP ports below 1024 on the server requires root.
 - **NAT** — If the client is behind NAT, the server sees the NAT gateway's IP, which may not match the source IP of raw ICMP packets sent by the client.  TCP and UDP probes are unaffected because the kernel handles their source IP assignment correctly through the NAT mapping.
 - **Reverse probes and NAT** — Reverse probes are sent to the client's public (NAT) address, so they will generally not reach a client behind NAT unless the NAT forwards them.
-- **Version compatibility** — `-r` and `-b` need a server built with reverse-probe support; an older server ignores the request and the client hangs.
+- **Version compatibility** — Client and server should be built from the same version.  `-r` and `-b` need a server built with reverse-probe support (an older server ignores the request and the client hangs), and ICMP probes from a version without sequence-number tagging are not recognized.
+- **IPv6 inbound filtering** — IPv6 clients usually have no NAT, but home and enterprise routers commonly block unsolicited inbound traffic, so reverse probes to them may not arrive.
 - **Host firewalls** — A firewall on the server machine (e.g., `iptables`, `nftables`) may block probe packets before they reach the listening socket, causing false *not received* results.
 
 ---

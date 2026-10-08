@@ -14,22 +14,30 @@
 
 /* ---------------------------------------------------------------- client session */
 
-static void handle_client(int ctrl_fd, uint32_t client_ip_net, int timeout_sec) {
+/*
+ * peer  - the client's address as seen on the control connection
+ * local - our end of the control connection; probes we send leave from here
+ * The session's address family (IPv4 or IPv6) is peer's family.
+ */
+static void handle_client(int ctrl_fd, const struct sockaddr_storage *peer,
+                          const struct sockaddr_storage *local, int timeout_sec) {
     uint8_t  msg_type;
     void    *payload;
     uint32_t plen;
+    int      family = peer->ss_family;
 
     /* Receive negotiate — informational only; no sockets opened yet */
     if (recv_msg(ctrl_fd, &msg_type, &payload, &plen) < 0 ||
-        msg_type != MSG_NEGOTIATE) {
+        msg_type != MSG_NEGOTIATE || plen < 4) {
         fprintf(stderr, "server: expected MSG_NEGOTIATE\n");
+        free(payload);
         return;
     }
     uint32_t probe_count;
     memcpy(&probe_count, payload, 4);
     probe_count = ntohl(probe_count);
     free(payload);
-    printf("Client negotiated %u probes\n", probe_count);
+    printf("Client negotiated %u probes (%s)\n", probe_count, family_name(family));
 
     /* Signal ready; per-probe sockets will be opened on demand */
     send_msg(ctrl_fd, MSG_READY, NULL, 0);
@@ -38,11 +46,10 @@ static void handle_client(int ctrl_fd, uint32_t client_ip_net, int timeout_sec) 
      * Keep one raw ICMP socket open for the whole session — it receives
      * all ICMP regardless of type, so there's no need to reopen it per probe.
      */
-    int icmp_fd = open_icmp_raw();
+    int icmp_fd = open_icmp_raw(family);
 
-    char client_ip[INET_ADDRSTRLEN];
-    struct in_addr cia = { client_ip_net };
-    inet_ntop(AF_INET, &cia, client_ip, sizeof(client_ip));
+    char client_ip[INET6_ADDRSTRLEN];
+    sa_ntop(peer, client_ip, sizeof(client_ip));
 
     /*
      * Probe loop.  Forward: open socket -> signal go -> receive probe ->
@@ -66,20 +73,20 @@ static void handle_client(int ctrl_fd, uint32_t client_ip_net, int timeout_sec) 
         payload = NULL;
 
         if (msg_type == MSG_RPROBE_REQ) {
-            printf("Sending %s %d to %s\n", proto_name(proto), number, client_ip);
-            send_probe(client_ip, proto, number, timeout_sec);
+            printf("Sending %s %d to %s\n", proto_name(proto, family), number, client_ip);
+            send_probe(peer, local, proto, number, timeout_sec, 1);
             send_msg(ctrl_fd, MSG_RPROBE_SENT, NULL, 0);
             continue;
         }
 
         /* Open the probe socket for this one probe */
-        int probe_fd = open_probe_socket(proto, number, icmp_fd);
+        int probe_fd = open_probe_socket(family, proto, number, icmp_fd);
 
         /* Tell client to fire the probe */
         send_msg(ctrl_fd, MSG_PROBE_GO, NULL, 0);
 
         /* Wait: returns as soon as the probe arrives or timeout expires */
-        int received = wait_probe(proto, probe_fd, number, client_ip_net, timeout_sec);
+        int received = wait_probe(proto, probe_fd, number, peer, timeout_sec, 0);
 
         /* Close per-probe socket; ICMP fd is kept open for the session */
         close_probe_socket(proto, probe_fd);
@@ -96,40 +103,81 @@ static void handle_client(int ctrl_fd, uint32_t client_ip_net, int timeout_sec) 
 
 /* ------------------------------------------------------------------- run_server */
 
-void run_server(int control_port, int timeout_sec) {
-    int srv_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (srv_fd < 0) { perror("server: socket"); return; }
+/*
+ * Control listener.  AF_UNSPEC: one dual-stack IPv6 socket (IPv4 clients
+ * arrive as ::ffff:a.b.c.d), falling back to IPv4 if IPv6 is unavailable.
+ * AF_INET / AF_INET6: that family only.
+ */
+static int open_control_listener(int port, int family) {
+    int fd = -1;
+    struct sockaddr_storage addr;
+    int on = 1, off = 0;
 
-    int on = 1;
-    setsockopt(srv_fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port        = htons(control_port);
-
-    if (bind(srv_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("server: bind control port");
-        close(srv_fd);
-        return;
+    if (family != AF_INET) {
+        fd = socket(AF_INET6, SOCK_STREAM, 0);
+        if (fd >= 0) {
+            setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY,
+                       family == AF_INET6 ? &on : &off, sizeof(int));
+            memset(&addr, 0, sizeof(addr));
+            addr.ss_family = AF_INET6;
+        } else if (family == AF_INET6) {
+            perror("server: IPv6 socket");
+            return -1;
+        }
     }
-    listen(srv_fd, 4);
-    printf("Server listening on control port %d  (Ctrl-C to stop)\n\n", control_port);
+    if (fd < 0) {
+        fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) { perror("server: socket"); return -1; }
+        memset(&addr, 0, sizeof(addr));
+        addr.ss_family = AF_INET;
+    }
+
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+    sa_set_port(&addr, port);
+    if (bind(fd, (struct sockaddr *)&addr, sa_len(&addr)) < 0) {
+        perror("server: bind control port");
+        close(fd);
+        return -1;
+    }
+    if (listen(fd, 4) < 0) {
+        perror("server: listen");
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+void run_server(int control_port, int timeout_sec, int family) {
+    int srv_fd = open_control_listener(control_port, family);
+    if (srv_fd < 0) return;
+
+    printf("Server listening on control port %d (%s)  (Ctrl-C to stop)\n\n",
+           control_port,
+           family == AF_INET ? "IPv4" : family == AF_INET6 ? "IPv6" : "IPv4+IPv6");
 
     /* Accept clients forever; Ctrl-C (SIGINT default) terminates the process */
     while (1) {
-        struct sockaddr_in client_addr;
-        socklen_t clen = sizeof(client_addr);
-        int ctrl_fd = accept(srv_fd, (struct sockaddr *)&client_addr, &clen);
+        struct sockaddr_storage peer, local;
+        socklen_t plen = sizeof(peer), llen = sizeof(local);
+        int ctrl_fd = accept(srv_fd, (struct sockaddr *)&peer, &plen);
         if (ctrl_fd < 0) {
             perror("server: accept");
             continue;   /* transient error; keep listening */
         }
+        if (getsockname(ctrl_fd, (struct sockaddr *)&local, &llen) < 0) {
+            perror("server: getsockname");
+            close(ctrl_fd);
+            continue;
+        }
+        sa_unmap(&peer);
+        sa_unmap(&local);
 
-        printf("Client connected from %s\n", inet_ntoa(client_addr.sin_addr));
-        handle_client(ctrl_fd, client_addr.sin_addr.s_addr, timeout_sec);
+        char ip[INET6_ADDRSTRLEN], ts[32];
+        printf("%s Client connected from %s\n",
+               timestamp_utc(ts, sizeof(ts)), sa_ntop(&peer, ip, sizeof(ip)));
+        handle_client(ctrl_fd, &peer, &local, timeout_sec);
         close(ctrl_fd);
-        printf("Session complete.  Waiting for next client...\n\n");
+        printf("%s Session complete.  Waiting for next client...\n\n",
+               timestamp_utc(ts, sizeof(ts)));
     }
 }

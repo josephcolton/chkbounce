@@ -18,6 +18,21 @@
 #define MSG_RPROBE_REQ   7   /* client->server: send me this probe (reverse) */
 #define MSG_RPROBE_SENT  8   /* server->client: reverse probe has been sent */
 
+/*
+ * Probe packet contents.  UDP probes carry PROBE_MAGIC; ICMP probes carry
+ * PROBE_ICMP_ID in the identifier field and a sequence number that encodes
+ * the type and direction, so a receiver can tell its probe apart from the
+ * kernel's automatic echo reply to an earlier probe (e.g. type 129 arriving
+ * in answer to a type 128 probe).  Receivers check the sequence number only:
+ * NATs rewrite the echo identifier.
+ */
+#define PROBE_MAGIC   "chkbounce"
+#define PROBE_ICMP_ID 0xCB0C
+
+static inline uint16_t probe_icmp_seq(int icmp_type, int reverse) {
+    return (uint16_t)((icmp_type << 1) | (reverse ? 1 : 0));
+}
+
 #define DEFAULT_CONTROL_PORT 1234
 #define DEFAULT_TIMEOUT      2
 

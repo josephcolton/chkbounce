@@ -1,4 +1,4 @@
-.TH CHKBOUNCE 8 "2026\-05\-05" "chkbounce" "System Administration Utilities"
+.TH CHKBOUNCE 8 "2026\-10\-08" "chkbounce" "System Administration Utilities"
 .
 .SH NAME
 chkbounce \- network packet reachability tester
@@ -6,6 +6,7 @@ chkbounce \- network packet reachability tester
 .SH SYNOPSIS
 .B chkbounce
 .B \-s
+.RB [ \-4 " | " \-6 ]
 .RB [ \-p
 .IR port ]
 .RB [ \-\-timeout= seconds ]
@@ -14,6 +15,7 @@ chkbounce \- network packet reachability tester
 .B chkbounce
 .B \-c
 .I server
+.RB [ \-4 " | " \-6 ]
 .RB [ \-p
 .IR port ]
 .RB [ \-i [ types ]]
@@ -23,6 +25,8 @@ chkbounce \- network packet reachability tester
 .RB [ \-\-timeout= seconds ]
 .RB [ \-o
 .IR file ]
+.RB [ \-\-csv= file ]
+.RB [ \-\-json= file ]
 .
 .SH DESCRIPTION
 .B chkbounce
@@ -37,13 +41,16 @@ fires the packet, then reports the result back over the control channel.
 Supported probe types are:
 .TP
 .B ICMP
-Raw ICMP packets with a specified type number (0\(en255).
+Raw ICMP packets (ICMPv6 in IPv6 sessions) with a specified type number (0\(en255).
 .TP
 .B TCP
 TCP connection attempts to specified port numbers.
 .TP
 .B UDP
 UDP datagrams sent to specified port numbers.
+.PP
+Each session runs over IPv4 or IPv6, chosen by the address the client
+connects to.
 .PP
 Both the client and the server must be run with root privileges (or
 .BR CAP_NET_RAW )
@@ -62,11 +69,24 @@ It runs until interrupted with
 .BI \-c " server" "\fR,\fP \-\-client"
 Run in client mode.
 .I server
-is the hostname or dotted\-decimal IPv4 address of the machine running
+is the hostname or numeric IPv4 or IPv6 address of the machine running
 .BR chkbounce\ \-s .
 Hostnames are resolved via DNS before connecting.
 .
 .SH OPTIONS
+.TP
+.BR \-4 ", " \-\-ipv4
+Client: resolve and connect over IPv4 only.
+Server: accept IPv4 clients only.
+.TP
+.BR \-6 ", " \-\-ipv6
+Client: resolve and connect over IPv6 only.
+Server: accept IPv6 clients only.
+By default the server accepts both families on one socket, and the client
+uses the first address the resolver returns.
+In IPv6 sessions,
+.B \-i
+type numbers are ICMPv6 types.
 .TP
 .BI \-p " port" "\fR,\fP \-\-port=" port
 TCP port number used for the control channel on both sides.
@@ -128,6 +148,24 @@ Write the final report to
 in addition to printing it to standard output.
 The file is created if it does not exist and overwritten if it does.
 Progress and connection messages are not written to the file.
+.TP
+.BI \-\-csv= file
+Append results to
+.I file
+as CSV, one row per probe and direction, with the columns
+.IR run_start ", " version ", " family ", " server_host ", " server_addr ", "
+.IR client_addr ", " timeout_sec ", " proto ", " number ", " direction ", "
+.IR received ", " probe_time .
+A header row is written if the file is new or empty.
+.TP
+.BI \-\-json= file
+Write the run as a single JSON document (metadata, per\-probe results for
+each direction, and a summary) to
+.IR file ,
+overwriting it.
+.TP
+.BR \-V ", " \-\-version
+Print the version and exit.
 .PP
 If none of
 .BR \-i ,
@@ -318,8 +356,20 @@ sudo chkbounce \-c 127.0.0.1 \-t80,443 \-u53
 .
 .SH NOTES
 .TP
-.B IPv4 only
-IPv6 is not currently supported.
+.B One address family per session
+Run the client twice with
+.B \-4
+and
+.B \-6
+to compare both families on a dual\-stack path.
+.TP
+.B ICMP probe tagging
+ICMP probes carry identifier 0xCB0C and sequence number
+.RI ( type " << 1) | " direction ,
+and receivers only count a probe whose type and sequence number match.
+This keeps kernel\-generated replies to earlier probes (for example an Echo
+Reply sent back for an Echo Request probe) from being counted as later probes.
+Client and server must be built from the same version.
 .TP
 .B One client at a time
 The server is single\-threaded and handles one client session at a time.

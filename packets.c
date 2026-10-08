@@ -14,7 +14,7 @@
 #include "protocol.h"
 #include "packets.h"
 
-/* ICMP header without the 56-byte data payload used for raw sends */
+/* ICMP/ICMPv6 header plus a short payload; same layout for both families */
 struct icmp_send_hdr {
     uint8_t  type;
     uint8_t  code;
@@ -24,29 +24,45 @@ struct icmp_send_hdr {
     char     data[32];
 } packed;
 
-int send_icmp_probe(const char *dstip, int icmp_type) {
-    int fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+/* Bind fd to src's address (any port) when src is given.  Returns 0 or -1. */
+static int bind_source(int fd, const struct sockaddr_storage *src) {
+    if (!src) return 0;
+    struct sockaddr_storage local = *src;
+    sa_set_port(&local, 0);
+    if (bind(fd, (struct sockaddr *)&local, sa_len(&local)) < 0) {
+        perror("bind probe source address");
+        return -1;
+    }
+    return 0;
+}
+
+int send_icmp_probe(const struct sockaddr_storage *dst,
+                    const struct sockaddr_storage *src,
+                    int icmp_type, int reverse) {
+    int v6 = dst->ss_family == AF_INET6;
+    int fd = socket(dst->ss_family, SOCK_RAW, v6 ? IPPROTO_ICMPV6 : IPPROTO_ICMP);
     if (fd < 0) {
         perror("send_icmp_probe: socket");
         return -1;
     }
+    if (bind_source(fd, src) < 0) { close(fd); return -1; }
 
     struct icmp_send_hdr pkt;
     memset(&pkt, 0, sizeof(pkt));
     pkt.type  = (uint8_t)icmp_type;
     pkt.code  = 0;
-    pkt.id    = htons(0x1234);
-    pkt.seq   = htons(1);
+    pkt.id    = htons(PROBE_ICMP_ID);
+    pkt.seq   = htons(probe_icmp_seq(icmp_type, reverse));
     memset(pkt.data, 'a', sizeof(pkt.data));
-    pkt.cksum = checksum(&pkt, sizeof(pkt));
+    memcpy(pkt.data, PROBE_MAGIC, sizeof(PROBE_MAGIC) - 1);
+    /* The kernel fills in the ICMPv6 checksum (it covers a pseudo-header) */
+    if (!v6)
+        pkt.cksum = checksum(&pkt, sizeof(pkt));
 
-    struct sockaddr_in dst;
-    memset(&dst, 0, sizeof(dst));
-    dst.sin_family = AF_INET;
-    inet_pton(AF_INET, dstip, &dst.sin_addr);
-
+    struct sockaddr_storage to = *dst;
+    sa_set_port(&to, 0);
     int bytes = sendto(fd, &pkt, sizeof(pkt), 0,
-                       (struct sockaddr *)&dst, sizeof(dst));
+                       (struct sockaddr *)&to, sa_len(&to));
     if (bytes < 0)
         perror("send_icmp_probe: sendto");
 
@@ -54,22 +70,22 @@ int send_icmp_probe(const char *dstip, int icmp_type) {
     return bytes;
 }
 
-int send_tcp_probe(const char *dstip, int port, int timeout_sec) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+int send_tcp_probe(const struct sockaddr_storage *dst,
+                   const struct sockaddr_storage *src,
+                   int port, int timeout_sec) {
+    int fd = socket(dst->ss_family, SOCK_STREAM, 0);
     if (fd < 0) return -1;
+    if (bind_source(fd, src) < 0) { close(fd); return -1; }
 
     /* Non-blocking connect so we can apply a timeout */
     int flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
-    struct sockaddr_in dst;
-    memset(&dst, 0, sizeof(dst));
-    dst.sin_family = AF_INET;
-    dst.sin_port   = htons(port);
-    inet_pton(AF_INET, dstip, &dst.sin_addr);
+    struct sockaddr_storage to = *dst;
+    sa_set_port(&to, port);
 
     int ret = 0;
-    if (connect(fd, (struct sockaddr *)&dst, sizeof(dst)) < 0) {
+    if (connect(fd, (struct sockaddr *)&to, sa_len(&to)) < 0) {
         if (errno != EINPROGRESS) {
             close(fd);
             return 0;
@@ -95,19 +111,18 @@ int send_tcp_probe(const char *dstip, int port, int timeout_sec) {
     return ret;
 }
 
-int send_udp_probe(const char *dstip, int port) {
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+int send_udp_probe(const struct sockaddr_storage *dst,
+                   const struct sockaddr_storage *src, int port) {
+    int fd = socket(dst->ss_family, SOCK_DGRAM, 0);
     if (fd < 0) return -1;
+    if (bind_source(fd, src) < 0) { close(fd); return -1; }
 
-    struct sockaddr_in dst;
-    memset(&dst, 0, sizeof(dst));
-    dst.sin_family = AF_INET;
-    dst.sin_port   = htons(port);
-    inet_pton(AF_INET, dstip, &dst.sin_addr);
+    struct sockaddr_storage to = *dst;
+    sa_set_port(&to, port);
 
-    const char payload[] = "chkbounce";
+    const char payload[] = PROBE_MAGIC;
     int bytes = sendto(fd, payload, sizeof(payload), 0,
-                       (struct sockaddr *)&dst, sizeof(dst));
+                       (struct sockaddr *)&to, sa_len(&to));
     if (bytes < 0)
         perror("send_udp_probe: sendto");
 
@@ -115,9 +130,11 @@ int send_udp_probe(const char *dstip, int port) {
     return bytes;
 }
 
-int send_probe(const char *dstip, int proto, int number, int timeout_sec) {
-    if (proto == PROTO_ICMP) return send_icmp_probe(dstip, number);
-    if (proto == PROTO_TCP)  return send_tcp_probe(dstip, number, timeout_sec);
-    if (proto == PROTO_UDP)  return send_udp_probe(dstip, number);
+int send_probe(const struct sockaddr_storage *dst,
+               const struct sockaddr_storage *src,
+               int proto, int number, int timeout_sec, int reverse) {
+    if (proto == PROTO_ICMP) return send_icmp_probe(dst, src, number, reverse);
+    if (proto == PROTO_TCP)  return send_tcp_probe(dst, src, number, timeout_sec);
+    if (proto == PROTO_UDP)  return send_udp_probe(dst, src, number);
     return -1;
 }
